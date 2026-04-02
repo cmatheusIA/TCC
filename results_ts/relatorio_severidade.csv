@@ -1,0 +1,7 @@
+tipo,chave,valor
+categoria,Indeterminado,35
+risco,Indeterminado,35
+resumo,pct_conforme_abnt,nan%
+resumo,limite_abnt_mm,0.2
+resumo,caa,CAA_III_IV
+resumo,n_nuvens_avaliadas,35
