@@ -1,0 +1,33 @@
+arquivo,categoria,abertura_mm,profundidade_mm,severidade_pct,risco,conforme_abnt
+avaria_10.ply,Rachadura,16.1717,119.0005,6.70,Crítico — intervenção imediata,False
+avaria_12.ply,Rachadura,21.8582,19.2519,0.60,Crítico — intervenção imediata,False
+avaria_13.ply,Rachadura,19.8294,16.0408,0.82,Crítico — intervenção imediata,False
+avaria_17.ply,Rachadura,11.0466,5.8713,0.23,Crítico — intervenção imediata,False
+avaria_19.ply,Rachadura,10.6674,158.8000,5.78,Crítico — intervenção imediata,False
+avaria_2.ply,Rachadura,15.0885,35.3720,0.10,Crítico — intervenção imediata,False
+avaria_20.ply,Rachadura,24.0193,80.3998,0.06,Crítico — intervenção imediata,False
+avaria_21.ply,Rachadura,19.8718,10.3035,0.39,Crítico — intervenção imediata,False
+avaria_22.ply,Rachadura,29.3249,146.2297,0.12,Crítico — intervenção imediata,False
+avaria_24.ply,Rachadura,19.1310,132.3823,1.35,Crítico — intervenção imediata,False
+avaria_26.ply,Rachadura,23.1885,104.6467,1.04,Crítico — intervenção imediata,False
+avaria_27.ply,Rachadura,12.1923,6.0567,0.06,Crítico — intervenção imediata,False
+avaria_28.ply,Indeterminado,0.0000,0.0000,0.00,Indeterminado,
+avaria_29.ply,Indeterminado,0.0000,0.0000,0.00,Indeterminado,
+avaria_3.ply,Rachadura,11.6316,79.7923,0.19,Crítico — intervenção imediata,False
+avaria_30.ply,Rachadura,21.2130,13.2886,0.05,Crítico — intervenção imediata,False
+avaria_31.ply,Rachadura,15.8214,5.4222,0.35,Crítico — intervenção imediata,False
+avaria_32.ply,Indeterminado,nan,nan,0.00,Indeterminado,
+avaria_33.ply,Rachadura,12.3960,415.5537,1.12,Crítico — intervenção imediata,False
+avaria_34.ply,Rachadura,16.7519,34.9357,1.72,Crítico — intervenção imediata,False
+avaria_35.ply,Rachadura,11.8823,157.2405,14.42,Crítico — intervenção imediata,False
+avaria_36.ply,Rachadura,17.7477,452.3923,1.62,Crítico — intervenção imediata,False
+avaria_37.ply,Rachadura,20.5530,95.3370,2.16,Crítico — intervenção imediata,False
+avaria_38.ply,Rachadura,21.0816,58.5077,0.07,Crítico — intervenção imediata,False
+avaria_39.ply,Indeterminado,nan,nan,0.02,Indeterminado,
+avaria_4.ply,Rachadura,16.3677,436.2006,4.29,Crítico — intervenção imediata,False
+avaria_40.ply,Rachadura,18.6523,127.1175,1.23,Crítico — intervenção imediata,False
+avaria_41.ply,Rachadura,12.4243,106.6276,20.30,Crítico — intervenção imediata,False
+avaria_42.ply,Rachadura,6.0786,94.0946,0.60,Crítico — intervenção imediata,False
+avaria_6.ply,Rachadura,10.2008,13.0655,11.80,Crítico — intervenção imediata,False
+avaria_7.ply,Rachadura,13.3060,181.6315,0.32,Crítico — intervenção imediata,False
+avaria_9.ply,Rachadura,14.2909,10.0614,0.77,Crítico — intervenção imediata,False

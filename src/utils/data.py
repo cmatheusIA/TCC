@@ -10,6 +10,7 @@
 from utils.config import *
 
 import logging
+import hashlib
 
 log = setup_logging(LOG_PATH)
 
@@ -168,28 +169,35 @@ class PointCloudPreprocessor:
 class PointCloudAugmentation:
     """
     Augmentações que simulam fenômenos físicos reais:
-    - Rotação (±15° geral, ±5° minor axes)   → variações de pose entre scans
+    - Rotação Z 0–360° (invariância de posição do scanner), X/Y ±5°
     - Escala  (0.85–1.15)                    → diferenças de distância ao scanner
     - Jitter  (σ=0.01)                       → ruído de medição LiDAR
     - Dropout (10%)                          → oclusão parcial / reflexão especular
+    - Spatial crop (r=0.4, p=0.4)           → força aprendizado de estatísticas locais
     Referência: Qi et al., 2017 (PointNet) | Thomas et al., 2019 (KPConv)
+                R3D-AD (Zhou et al., ECCV 2024) | Uni-3DAD (Liu et al., 2025)
     """
 
-    def __init__(self, rotation_range=15.0, scale_range=(0.85, 1.15),
-                 jitter_std=0.01, dropout_ratio=0.10):
-        self.rotation_range = rotation_range
-        self.scale_range    = scale_range
-        self.jitter_std     = jitter_std
-        self.dropout_ratio  = dropout_ratio
+    def __init__(self, scale_range=(0.85, 1.15), jitter_std=0.01,
+                 dropout_ratio=0.10, spatial_crop=True,
+                 spatial_crop_radius=0.4, spatial_crop_prob=0.4):
+        self.scale_range         = scale_range
+        self.jitter_std          = jitter_std
+        self.dropout_ratio       = dropout_ratio
+        self.spatial_crop        = spatial_crop
+        self.spatial_crop_radius = spatial_crop_radius
+        self.spatial_crop_prob   = spatial_crop_prob
 
     def __call__(self, xyz, features=None, labels=None):
         xyz = xyz.copy()
 
-        # Rotação aleatória
-        if random.random() < 0.7:
+        # Rotação: Z irrestrito (0–360°), X/Y limitado a ±5° para preservar normais
+        # R3D-AD (Zhou et al., ECCV 2024): rotação de eixo de gravidade completa (360°)
+        # Uni-3DAD (Liu et al., 2025): X/Y ≤ ±5° para não inverter direção das normais
+        if random.random() < 0.8:
             angles = [random.uniform(-5, 5),
                       random.uniform(-5, 5),
-                      random.uniform(-self.rotation_range, self.rotation_range)]
+                      random.uniform(0, 360)]
             rot = Rotation.from_euler('xyz', angles, degrees=True)
             xyz = rot.apply(xyz)
 
@@ -209,6 +217,20 @@ class PointCloudAugmentation:
             xyz    = xyz[idx]
             if features is not None: features = features[idx]
             if labels   is not None: labels   = labels[idx]
+
+        # Spatial crop: seleciona patch esférico local (radius=0.4)
+        # Rachaduras são fenômenos locais — treinar em patches força o modelo a aprender
+        # estatísticas de superfície em escala local (R3D-AD, Zhou et al., ECCV 2024).
+        # Aplicado APENAS em nuvens normais (spatial_crop=False para avaria_*).
+        if self.spatial_crop and random.random() < self.spatial_crop_prob:
+            center = xyz[np.random.randint(len(xyz))]
+            dists  = np.linalg.norm(xyz - center, axis=1)
+            mask   = dists < self.spatial_crop_radius
+            if mask.sum() >= 64:
+                idx      = np.where(mask)[0]
+                xyz      = xyz[idx]
+                if features is not None: features = features[idx]
+                if labels   is not None: labels   = labels[idx]
 
         return xyz.astype(np.float32), features, labels
 
@@ -233,11 +255,12 @@ class PointCloudDataset(Dataset):
     """
 
     def __init__(self, data_list: list, augment: bool = False,
-                 preprocessor: PointCloudPreprocessor = None):
+                 preprocessor: PointCloudPreprocessor = None,
+                 spatial_crop: bool = True):
         self.data         = data_list
         self.augment      = augment
         self.preprocessor = preprocessor
-        self.augmentor    = PointCloudAugmentation() if augment else None
+        self.augmentor    = PointCloudAugmentation(spatial_crop=spatial_crop) if augment else None
 
     def __len__(self):
         return len(self.data)
@@ -372,24 +395,30 @@ def load_ply_file(path: str, preprocessor: PointCloudPreprocessor = None) -> dic
                   else np.zeros(len(xyz), dtype=np.int64)
         extra   = proc['extra']
 
-        # ── Feature vector 15D ───────────────────────────────────────────────
-        # [xyz(3), rgb(3), normals(3), scalar(1), label_feat(1), curv(1), dens(1), var(1), sv(1)]
-        # label_feat: incluso como feature pois nuvens de treino têm label=0 em todos os pontos
-        #             (sinal de superfície normal); nas nuvens de avaliação, o modelo verá
-        #             valores anômalos de reconstrução nessa dimensão.
-        features = np.concatenate([
-            xyz,                              # 3
-            rgb,                              # 3
-            normals,                          # 3
-            scalar,                           # 1
-            labels.reshape(-1, 1).astype(np.float32),   # 1  (label_feat)
-            extra['curvature'],               # 1
-            extra['density'],                 # 1
-            extra['variance'],                # 1
-            extra['surface_variation'],       # 1
-        ], axis=1).astype(np.float32)        # → [N, 15]
+        # ── Feature vector 16D ───────────────────────────────────────────────
+        # [xyz(3), rgb(3), normals(3), scalar(1), curv(1), dens(1), var(1), sv(1), lum(1), sat(1)]
+        # scalar_labels EXCLUÍDO: incluí-lo como feature vaza o ground truth para o modelo
+        #   — durante treino é 0 em todos os pontos, durante avaliação é 1 nos cracks,
+        #     gerando erro de reconstrução garantido nessa dimensão (avaliação inflada).
+        # lum: luminosidade média (R+G+B)/3 normalizada — rachaduras ≈0.21 vs normal ≈0.64
+        # sat: saturação cromática max(RGB)-min(RGB) — rachaduras ≈0.05 vs normal ≈0.35
+        lum = rgb.mean(axis=1, keepdims=True)                        # (N,1) ∈ [0,1]
+        sat = (rgb.max(axis=1) - rgb.min(axis=1)).reshape(-1, 1)     # (N,1) ∈ [0,1]
 
-        # Garantir 15D exatamente
+        features = np.concatenate([
+            xyz,                      # 3  → cols 0-2
+            rgb,                      # 3  → cols 3-5
+            normals,                  # 3  → cols 6-8
+            scalar,                   # 1  → col  9
+            extra['curvature'],       # 1  → col 10
+            extra['density'],         # 1  → col 11
+            extra['variance'],        # 1  → col 12
+            extra['surface_variation'],# 1  → col 13
+            lum,                      # 1  → col 14
+            sat,                      # 1  → col 15
+        ], axis=1).astype(np.float32) # → [N, 16]
+
+        # Garantir 16D exatamente
         if features.shape[1] != INPUT_DIM:
             pad = INPUT_DIM - features.shape[1]
             features = np.concatenate(
@@ -411,13 +440,25 @@ def load_ply_file(path: str, preprocessor: PointCloudPreprocessor = None) -> dic
 
 
 def load_folder(folder: str) -> list:
-    """Carrega todos os PLY de uma pasta."""
+    """Carrega todos os PLY de uma pasta, descartando duplicatas pós-processamento.
+
+    Dois arquivos PLY diferentes podem produzir features idênticas após
+    outlier removal + voxelização — deduplicação por hash MD5 das features
+    evita que métricas de avaliação sejam distorcidas por nuvens repetidas.
+    """
     ply_files = sorted(Path(folder).glob('**/*.ply'))
     log.info(f"Encontrados {len(ply_files)} arquivos PLY em {folder}")
-    data = []
+    data        = []
+    seen_hashes = set()
     for p in ply_files:
         d = load_ply_file(str(p))
         if d is not None:
+            feat_hash = hashlib.md5(d['features'].tobytes()).hexdigest()
+            if feat_hash in seen_hashes:
+                log.warning(f"  DUPLICATA ignorada: {d['filename']} "
+                            f"(features idênticas após pré-processamento)")
+                continue
+            seen_hashes.add(feat_hash)
             data.append(d)
             log.info(f"  OK {d['filename']} | {d['n_points'] if 'n_points' in d else len(d['features']):,} pts | crack={d['has_crack']}")
     log.info(f"  → {len(data)} nuvens carregadas")
@@ -474,7 +515,8 @@ def make_loaders(train_list: list, eval_list: list,
 
     labeled_dl = None
     if labeled_list:
-        labeled_ds = PointCloudDataset(labeled_list, augment=True, preprocessor=None)
+        # spatial_crop=False: preserva rachaduras completas nas nuvens avaria_*
+        labeled_ds = PointCloudDataset(labeled_list, augment=True, preprocessor=None, spatial_crop=False)
         labeled_dl = DataLoader(labeled_ds, batch_size=1, shuffle=True,
                                 collate_fn=collate_fn, num_workers=nw,
                                 pin_memory=ENV_CONFIG['pin_memory'],

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import open3d as o3d
-from plyfile import PlyData
+from plyfile import PlyData, PlyElement
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
@@ -72,11 +72,11 @@ VIS_PATH        = f'{BASE_PATH}/visualizations_ts'
 LOG_PATH        = f'{BASE_PATH}/logs_ts'
 
 KPCONV_WEIGHTS        = f'{PRETRAINED}/kpconv_s3dis_202010091238.pth'
-PTRANSF_WEIGHTS       = f'{PRETRAINED}/ptv3_scannet200.pth'         # PTv3 ScanNet200 (tentativa A ou B)
+PTRANSF_WEIGHTS       = f'{PRETRAINED}/ptv3_scannet200.pth'            # PTv3 ScanNet200 (tentativa A ou B)
 PTRANSF_WEIGHTS_S3DIS = f'{PRETRAINED}/pointtransformer_s3dis_202109241350utc.pth'  # fallback C
 
 # ── Hiperparâmetros compartilhados ────────────────────────────────────────────
-INPUT_DIM    = 15      # xyz(3)+rgb(3)+normals(3)+scalar(1)+label(1)+curv(1)+dens(1)+var(1)+sv(1)
+INPUT_DIM    = 16      # xyz(3)+rgb(3)+normals(3)+scalar(1)+curv(1)+dens(1)+var(1)+sv(1)+lum(1)+sat(1)
 D_MODEL      = 128     # dimensão interna do PointTransformer
 NUM_HEADS    = 8       # cabeças de atenção
 NUM_LAYERS   = 4       # blocos transformer

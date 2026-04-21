@@ -35,12 +35,31 @@ RESULTS    = f'{BASE_PATH}/results_v5'
 MODELS     = f'{BASE_PATH}/models_v5'
 VIS_PATH   = f'{BASE_PATH}/visualizations_v5'
 LOGS_PATH  = f'{BASE_PATH}/logs_v5'
+PLY_PATH   = f'{BASE_PATH}/visualizations_v5/ply'
 
 NUM_EPOCHS   = 100
 LR_G         = 1e-4
 LR_D         = 1e-4
 LAMBDA_GP    = 10.0
 LAMBDA_RECON = 1.0
+
+# Limite de pontos por chunk na inferência do Generator.
+#
+# Por que chunkar o Generator em inferência?
+#   KPFCNNInspiredAdvanced (encoder do Generator) e PointTransformerInspiredAdvanced
+#   (Discriminator) usam LocalFeatureAggregation e SpatialMultiHeadSelfAttention,
+#   ambos com torch.cdist(xyz, xyz) — matriz O(N²) em VRAM.
+#   Para N=22 000 pts: 22000² × 4 bytes ≈ 1,9 GB por chamada.
+#
+# Por que SÓ na inferência?
+#   O training loop já tem OOM recovery:
+#     1. N_CRITIC adaptativo (< 200k → 5, 200k-500k → 3, > 500k → 1)
+#     2. Retry com gradient checkpointing (troca ~30% compute por ~40% menos VRAM)
+#   O chunking em backprop quebraria o gradient penalty do WGAN-GP, que precisa
+#   do gradiente sobre a nuvem completa.
+#
+# compute_anomaly_scores() usa torch.no_grad() — chunking é seguro e eficaz.
+GAN_CHUNK_SIZE = 8_000   # mesmo valor de TEACHER_CHUNK_SIZE em teacher_student_v1.py
 
 log = setup_logging(LOGS_PATH)
 
@@ -89,7 +108,7 @@ def train_wgan(generator: nn.Module,
     Fase 1 (0 … phase1_end):
       Encoders pré-treinados congelados. Apenas as camadas novas
       (feature_projection, feature_adapter, decoder, heads) aprendem.
-      Previne destruição dos pesos S3DIS antes de estabilizar o treino.
+      Previne destruição dos pesos pré-treinados (PTv3/ScanNet200) antes de estabilizar o treino.
 
     Fase 2 (phase1_end … fim):
       Fine-tuning completo com LR×0.1 para ajuste sutil ao domínio
@@ -288,11 +307,24 @@ def train_wgan(generator: nn.Module,
                 ep_g.append(g_v)
                 ep_r.append(r_v)
 
-                # ── Memory bank: coletar features normais ─────────────────────
+                # ── Memory bank: coletar features normais (chunked) ───────────
+                # Mesmo problema do compute_anomaly_scores: generator.encoder usa
+                # LocalFeatureAggregation com torch.cdist O(N²).
+                # Cenário crítico: _train_batch() passou só com checkpointing
+                # (VRAM apertada) — sem chunking aqui causaria OOM no no_grad call
+                # e o batch seria descartado do banco pelo try/except externo.
                 if memory_bank is not None and epoch >= phase1_end:
                     with torch.no_grad():
-                        x_flat    = real.reshape(-1, real.size(-1))
-                        bottleneck, _ = generator.encoder(x_flat)
+                        x_flat = real.reshape(-1, real.size(-1))   # (N, 15)
+                        if N_pts <= GAN_CHUNK_SIZE:
+                            bottleneck, _ = generator.encoder(x_flat)
+                        else:
+                            btn_chunks = []
+                            for _s in range(0, N_pts, GAN_CHUNK_SIZE):
+                                _e = min(_s + GAN_CHUNK_SIZE, N_pts)
+                                _btn, _ = generator.encoder(x_flat[_s:_e])
+                                btn_chunks.append(_btn)
+                            bottleneck = torch.cat(btn_chunks, dim=0)  # (N, 512)
                     memory_bank.update(bottleneck.cpu())
 
                 batch_times.append(time.time() - batch_t)
@@ -386,7 +418,8 @@ def compute_anomaly_scores(generator: nn.Module,
                             device: torch.device,
                             memory_bank: NormalMemoryBank = None,
                             alpha_recon: float = 0.7,
-                            alpha_bank:  float = 0.3) -> list:
+                            alpha_bank:  float = 0.3,
+                            chunk_size: int = GAN_CHUNK_SIZE) -> list:
     """
     Score de anomalia composto por dois termos:
 
@@ -411,20 +444,45 @@ def compute_anomaly_scores(generator: nn.Module,
         features = torch.tensor(
             d['features'], dtype=torch.float32).unsqueeze(0).to(device)
         labels   = d['labels']
+        N_pts    = features.size(1)
 
-        # ── Reconstrução ──────────────────────────────────────────────────────
-        with autocast():
-            recon = generator(features)          # (1, N, 15)
+        # ── Reconstrução (chunked para evitar OOM em nuvens grandes) ──────────
+        # KPFCNNInspiredAdvanced usa LocalFeatureAggregation com torch.cdist O(N²).
+        # Sem chunking: N=22 000 → ~1,9 GB por chamada cdist × 3–4 chamadas → OOM.
+        # Com chunking: cada chunk processa GAN_CHUNK_SIZE pontos de forma independente
+        # e os resultados são concatenados — mesmo trade-off de borda do teacher_student.
+        # Em inferência (torch.no_grad()) o chunking é seguro — sem impacto no gradiente.
+        if N_pts <= chunk_size:
+            with autocast():
+                recon = generator(features)                      # (1, N, 15)
+        else:
+            recon_chunks = []
+            for start in range(0, N_pts, chunk_size):
+                end = min(start + chunk_size, N_pts)
+                with autocast():
+                    r_chunk = generator(features[:, start:end, :])   # (1, chunk, 15)
+                recon_chunks.append(r_chunk)
+            recon = torch.cat(recon_chunks, dim=1)               # (1, N, 15)
 
         recon_err = (recon - features).pow(2).mean(dim=-1).squeeze(0).cpu().numpy()
         # Normalizar intra-nuvem
         lo, hi = recon_err.min(), recon_err.max()
         recon_norm = (recon_err - lo) / (hi - lo + 1e-8)
 
-        # ── Distância ao banco de memória ─────────────────────────────────────
+        # ── Distância ao banco de memória (encoder chunked) ───────────────────
+        # generator.encoder = KPFCNNInspiredAdvanced — mesma operação cdist acima.
+        # Chunking idêntico: concatena bottlenecks por chunk, depois consulta o banco.
         if memory_bank is not None and memory_bank.bank is not None:
-            x_flat    = features.reshape(-1, features.size(-1))
-            bottleneck, _ = generator.encoder(x_flat)   # (N, 512)
+            x_flat = features.reshape(-1, features.size(-1))    # (N, 15)
+            if N_pts <= chunk_size:
+                bottleneck, _ = generator.encoder(x_flat)       # (N, 512)
+            else:
+                btn_chunks = []
+                for start in range(0, N_pts, chunk_size):
+                    end = min(start + chunk_size, N_pts)
+                    btn, _ = generator.encoder(x_flat[start:end])
+                    btn_chunks.append(btn)
+                bottleneck = torch.cat(btn_chunks, dim=0)        # (N, 512)
             bank_dist  = memory_bank.score(bottleneck.cpu(), k=5)
             # Normalizar
             lo2, hi2   = bank_dist.min(), bank_dist.max()
@@ -440,6 +498,8 @@ def compute_anomaly_scores(generator: nn.Module,
             'score'      : score,    # score composto — usado para threshold
             'gt_labels'  : labels,
             'n_points'   : len(labels),
+            'xyz'        : d['features'][:, :3],
+            'rgb'        : d['features'][:, 3:6],
         })
 
     return results
@@ -587,7 +647,7 @@ def main():
     print(f"  {datetime.now():%Y-%m-%d %H:%M:%S}")
     print("="*70)
 
-    for p in [RESULTS, MODELS, VIS_PATH, LOGS_PATH]:
+    for p in [RESULTS, MODELS, VIS_PATH, LOGS_PATH, PLY_PATH]:
         os.makedirs(p, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -675,8 +735,13 @@ def main():
     metrics = evaluate(results)
 
     # ── 9. Visualizações + Salvamento ─────────────────────────────────────────
+    results = compute_severity(results)
     plot_error_distribution(results, thr, gmm_info, ts=ts)
     save_results(metrics, results, history, thr, gmm_info, ts=ts)
+    try:
+        visualize_cracks(results, save_dir=VIS_PATH, max_clouds=10, ts=ts)
+    except Exception as e:
+        log.error(f"visualize_cracks falhou: {e}", exc_info=True)
 
     # ── Resumo final ──────────────────────────────────────────────────────────
     print("\n" + "="*70)

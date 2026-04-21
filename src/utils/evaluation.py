@@ -110,6 +110,294 @@ def apply_threshold(results: list, thr: float) -> list:
         r['threshold']   = thr
     return results
 
+
+def compute_crack_sf_interval(data_list: list) -> tuple:
+    """
+    Aprende o intervalo [sf_min, sf_max] do scalar_Scalar_field para pontos
+    de rachadura (label == 1) a partir dos dados de TREINO.
+
+    Por que usar o intervalo de treino?
+      As nuvens de treino têm labels por ponto indicando quais são rachadura.
+      Em inferência (test), essas labels não existem. Portanto, usamos o
+      intervalo aprendido como restrição hard: nenhum ponto fora de
+      [sf_min, sf_max] pode ser predito como rachadura.
+
+    Motivação física:
+      Rachaduras absorvem mais luz e retornam menor intensidade no scanner
+      (scalar_Scalar_field menor). O intervalo aprendido captura exatamente
+      a faixa de intensidade observada em pontos confirmados como rachadura.
+
+    Retorna:
+      (sf_min, sf_max) — intervalo global de scalar_field para label=1.
+      Se não houver pontos label=1 nos dados, retorna (0.0, inf).
+    """
+    sf_crack = []
+
+    for d in data_list:
+        labels = d.get('labels')
+        if labels is None:
+            continue
+        crack_mask = (labels == 1)
+        if not crack_mask.any():
+            continue
+        sf = d['features'][:, 9]   # scalar_Scalar_field — col 9 do vetor de 15 features
+        sf_crack.append(sf[crack_mask])
+
+    if not sf_crack:
+        log.warning("compute_crack_sf_interval: nenhum ponto label=1 encontrado. "
+                    "Intervalo não aplicado.")
+        return 0.0, float('inf')
+
+    all_sf = np.concatenate(sf_crack)
+    sf_min, sf_max = float(all_sf.min()), float(all_sf.max())
+    log.info(f"Intervalo scalar_field para crack (label=1): [{sf_min:.2f}, {sf_max:.2f}]  "
+             f"({len(all_sf):,} pontos de rachadura)")
+    return sf_min, sf_max
+
+
+def apply_scalar_field_gate(results: list,
+                             sf_min: float,
+                             sf_max: float) -> list:
+    """
+    Pós-filtro supervisionado: reverte pred_labels=1 para 0 em pontos cujo
+    scalar_field está FORA do intervalo aprendido no treino [sf_min, sf_max].
+
+    Lógica:
+      - O intervalo [sf_min, sf_max] foi derivado de pontos label=1 no treino.
+      - Qualquer ponto fora desse intervalo nunca foi observado como rachadura
+        no conjunto de treino → não pode ser uma predição válida.
+      - Elimina falsos positivos em regiões de alta intensidade de retorno
+        (superfícies lisas que o modelo confunde com anomalias).
+
+    Não altera `score` — apenas `pred_labels`. AUROC permanece intacto.
+    """
+    for r in results:
+        sf_raw = r.get('scalar_field')
+        if sf_raw is None or 'pred_labels' not in r:
+            continue
+
+        sf   = np.asarray(sf_raw, dtype=np.float32)
+        pred = r['pred_labels'].copy()
+
+        outside = (sf < sf_min) | (sf > sf_max)
+        pred[outside] = 0
+        r['pred_labels'] = pred
+
+    return results
+
+# ============================================================================
+# SCALAR FIELD GMM — prior estatístico por nuvem
+# ============================================================================
+
+class ScalarFieldGMM:
+    """
+    Ajusta GMM 1D ao scalar_field de uma nuvem para distinguir rachaduras
+    de superfície normal sem usar labels humanos.
+
+    Para nuvens com scalar_Scalar_field (bimodal, gap≥0): valley detection
+    identifica o threshold com alta confiança.
+    Para nuvens com scalar_R (unimodal): retorna comportamento neutro
+    (weights=1.0, confidence=0.0) — transparente para o pipeline downstream.
+
+    Uso:
+        gmm = ScalarFieldGMM(scalar_field_array).fit()
+        probs   = gmm.anomaly_probability()       # (N,) ∈ [0,1]
+        weights = gmm.soft_weights()              # (N,) — gate soft
+        conf    = gmm.pseudo_label_confidence()   # (N,) — peso para Push-Pull
+    """
+
+    def __init__(self, scalar: np.ndarray, n_components: int = 2):
+        self.scalar = np.asarray(scalar, dtype=np.float32).ravel()
+        self.n_components = n_components
+        self._gmm        = None
+        self._modality   = None
+        self._threshold  = None
+        self._crack_idx  = None
+        self._fitted     = False
+
+    def fit(self) -> 'ScalarFieldGMM':
+        from sklearn.mixture import GaussianMixture
+
+        scalar = self.scalar
+        X      = scalar.reshape(-1, 1)
+
+        # Edge case: valores insuficientes ou constantes
+        if len(scalar) < 10 or scalar.std() < 1e-6:
+            self._modality  = 'unimodal'
+            self._threshold = float(scalar.mean())
+            self._fitted    = True
+            return self
+
+        # ── Fit GMM com 1, 2 e 3 componentes; escolhe por BIC ────────────────
+        # 3 componentes cobre nuvens onde o concreto normal tem sub-estrutura
+        # (ex: região abaixo E acima do intervalo de rachadura).
+        best_gmm  = None
+        best_bic  = np.inf
+        gmm1_bic  = np.inf
+        try:
+            for k in (1, 2, 3):
+                g = GaussianMixture(
+                    n_components=k, covariance_type='full',
+                    max_iter=300, random_state=42, n_init=5,
+                )
+                g.fit(X)
+                b = g.bic(X)
+                if k == 1:
+                    gmm1_bic = b
+                if b < best_bic:
+                    best_bic = b
+                    best_gmm = g
+        except Exception as e:
+            log.warning(f"ScalarFieldGMM: GMM falhou ({e})")
+            self._modality  = 'unimodal'
+            self._threshold = float(np.percentile(scalar, 50))
+            self._fitted    = True
+            return self
+
+        n_best = best_gmm.n_components
+
+        # ── Seleção do componente de rachadura ────────────────────────────────
+        # Princípio: rachaduras são a classe MINORITÁRIA — o intervalo de crack
+        # representa uma fração pequena dos pontos (~5-15%), independente de
+        # qual faixa de scalar_field corresponde (pode ser média, baixa ou alta).
+        # argmin(weights) é mais robusto que argmin(means) para intervalos não-extremos.
+        weights = best_gmm.weights_.ravel()
+        means   = best_gmm.means_.ravel()
+        crack_candidate = int(np.argmin(weights))
+
+        # Sanidade: se o componente minoritário ainda tem peso > 0.4, a divisão
+        # está muito equilibrada — o GMM não encontrou um cluster isolado de crack.
+        # Nesse caso, tratar como unimodal (score neutro 0.5).
+        if weights[crack_candidate] > 0.40:
+            self._gmm       = None
+            self._modality  = 'unimodal'
+            self._threshold = float(np.percentile(scalar, 50))
+            self._fitted    = True
+            return self
+
+        self._gmm       = best_gmm
+        self._crack_idx = crack_candidate
+
+        # ── Detecção de multimodalidade significativa ─────────────────────────
+        # Exige que o modelo multi-componente seja melhor que o unimodal por BIC
+        # e que o componente de crack tenha separação mínima dos demais.
+        bic_improvement = gmm1_bic - best_bic   # > 0 se multi é melhor
+
+        normal_means = np.delete(means, crack_candidate)
+        crack_mean   = means[crack_candidate]
+        crack_std    = float(np.sqrt(best_gmm.covariances_.ravel()[crack_candidate]))
+        min_sep      = float(np.min(np.abs(normal_means - crack_mean))) / (crack_std + 1e-8)
+
+        if bic_improvement > 10 and min_sep > 0.5:
+            self._modality = 'bimodal'
+            # Threshold: mínimo da pdf entre o crack e o componente normal mais próximo
+            closest_normal_mean = float(normal_means[np.argmin(np.abs(normal_means - crack_mean))])
+            lo = min(crack_mean, closest_normal_mean)
+            hi = max(crack_mean, closest_normal_mean)
+            x_search  = np.linspace(lo, hi, 500).reshape(-1, 1)
+            log_probs  = best_gmm.score_samples(x_search)
+            self._threshold = float(x_search[int(np.argmin(log_probs)), 0])
+        else:
+            self._modality  = 'unimodal'
+            self._threshold = float(np.percentile(scalar, 50))
+
+        self._fitted = True
+        return self
+
+    def _ensure_fitted(self):
+        if not self._fitted:
+            self.fit()
+
+    def anomaly_probability(self) -> np.ndarray:
+        """P(rachadura | scalar_field[i]) por ponto. Unimodal → ~0.5 uniforme."""
+        self._ensure_fitted()
+        if self._modality == 'unimodal' or self._gmm is None:
+            return np.full(len(self.scalar), 0.5, dtype=np.float32)
+        probs = self._gmm.predict_proba(self.scalar.reshape(-1, 1))
+        return probs[:, self._crack_idx].astype(np.float32)
+
+    def soft_weights(self) -> np.ndarray:
+        """
+        Gate soft: peso por ponto para modular o anomaly score.
+        Unimodal → 1.0 (transparente). Bimodal → P(crack|sf).
+        """
+        self._ensure_fitted()
+        if self._modality == 'unimodal':
+            return np.ones(len(self.scalar), dtype=np.float32)
+        return self.anomaly_probability()
+
+    def pseudo_label_confidence(self) -> np.ndarray:
+        """
+        Confiança do pseudo-label por ponto.
+        Unimodal → 0.0. Bimodal → |P(crack) - 0.5| * 2 ∈ [0,1].
+        """
+        self._ensure_fitted()
+        if self._modality == 'unimodal':
+            return np.zeros(len(self.scalar), dtype=np.float32)
+        probs = self.anomaly_probability()
+        return (np.abs(probs - 0.5) * 2.0).astype(np.float32)
+
+    def crack_interval(self) -> tuple:
+        """(x_min, x_max) do cluster de rachadura no scalar_field."""
+        self._ensure_fitted()
+        crack_mask = self.scalar <= self._threshold
+        if crack_mask.sum() == 0:
+            return (float(self.scalar.min()), float(self._threshold))
+        crack_vals = self.scalar[crack_mask]
+        return (float(crack_vals.min()), float(crack_vals.max()))
+
+    @property
+    def threshold(self) -> float:
+        self._ensure_fitted()
+        return self._threshold
+
+    @property
+    def modality(self) -> str:
+        self._ensure_fitted()
+        return self._modality
+
+
+# ============================================================================
+# SAÍDA PLY COLORIDA
+# ============================================================================
+
+def save_colored_ply(
+    xyz: np.ndarray,
+    rgb_orig: np.ndarray,
+    pred_labels: np.ndarray,
+    path: str,
+    crack_color: tuple = (255, 0, 0),
+) -> None:
+    """
+    Salva nuvem de pontos PLY com rachaduras coloridas.
+    Pontos normais (pred_labels=0): cor original preservada.
+    Pontos de rachadura (pred_labels=1): crack_color (vermelho padrão).
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+    rgb_out = rgb_orig.copy()
+    crack_rgb_norm = np.array(crack_color, dtype=np.float32) / 255.0
+    rgb_out[pred_labels == 1] = crack_rgb_norm
+
+    rgb_uint8 = (rgb_out * 255.0).clip(0, 255).astype(np.uint8)
+
+    n = len(xyz)
+    vertex = np.zeros(n, dtype=[
+        ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+        ('red', 'u1'), ('green', 'u1'), ('blue', 'u1'),
+    ])
+    vertex['x']     = xyz[:, 0]
+    vertex['y']     = xyz[:, 1]
+    vertex['z']     = xyz[:, 2]
+    vertex['red']   = rgb_uint8[:, 0]
+    vertex['green'] = rgb_uint8[:, 1]
+    vertex['blue']  = rgb_uint8[:, 2]
+
+    el = PlyElement.describe(vertex, 'vertex')
+    PlyData([el]).write(path)
+    log.info(f"PLY salvo: {path}  ({n:,} pts, "
+             f"{int(pred_labels.sum()):,} rachaduras em vermelho)")
+
 # ============================================================================
 # CHAMFER DISTANCE
 # ============================================================================
@@ -754,18 +1042,49 @@ def visualize_cracks(results: list,
         fp = pred & ~gt
         fn = ~pred & gt
 
-        # ── PLY colorido ──────────────────────────────────────────────────
-        colors = np.full((len(xyz), 3), 200, dtype=np.uint8)  # cinza padrão
-        colors[tp] = [255,   0,   0]   # vermelho — avaria detectada (TP)
-        colors[fp] = [255, 165,   0]   # laranja  — falso positivo
-        colors[fn] = [  0,   0, 255]   # azul     — avaria perdida (FN)
+        # ── PLY colorido + scalar_field ───────────────────────────────────
+        # Usa cores reais da nuvem; destaca apenas a rachadura predita em vermelho.
+        rgb_orig = r.get('rgb')   # (N, 3) em [0, 1], pode ser None
+        if rgb_orig is not None:
+            colors = (np.clip(rgb_orig, 0.0, 1.0) * 255).astype(np.uint8)
+        else:
+            colors = np.full((len(xyz), 3), 200, dtype=np.uint8)
 
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
-        pcd.colors = o3d.utility.Vector3dVector(
-            colors.astype(np.float64) / 255.0)
-        o3d.io.write_point_cloud(
-            os.path.join(save_dir, f'{fname}_avarias_{ts}.ply'), pcd)
+        colors[pred] = [255, 0, 0]   # vermelho — rachadura detectada (TP + FP)
+
+        sf_vals = r.get('scalar_field')   # (N,) ou None
+
+        ply_path = os.path.join(save_dir, f'{fname}_avarias_{ts}.ply')
+
+        if sf_vals is not None:
+            # Salva PLY binário com scalar_field e anomaly_score como propriedades extras.
+            # Usa PlyData/PlyElement para escrita eficiente (sem loop Python por ponto).
+            from plyfile import PlyElement
+            n = len(xyz)
+            xy    = xyz.astype(np.float32)
+            sf_arr = np.asarray(sf_vals, dtype=np.float32)
+            sc_arr = score.astype(np.float32)
+            vertex_data = np.empty(n, dtype=[
+                ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+                ('red', 'u1'), ('green', 'u1'), ('blue', 'u1'),
+                ('scalar_field', 'f4'),
+                ('anomaly_score', 'f4'),
+            ])
+            vertex_data['x'] = xy[:, 0]
+            vertex_data['y'] = xy[:, 1]
+            vertex_data['z'] = xy[:, 2]
+            vertex_data['red']   = colors[:, 0]
+            vertex_data['green'] = colors[:, 1]
+            vertex_data['blue']  = colors[:, 2]
+            vertex_data['scalar_field']  = sf_arr
+            vertex_data['anomaly_score'] = sc_arr
+            PlyData([PlyElement.describe(vertex_data, 'vertex')]).write(ply_path)
+        else:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
+            pcd.colors = o3d.utility.Vector3dVector(
+                colors.astype(np.float64) / 255.0)
+            o3d.io.write_point_cloud(ply_path, pcd)
 
         # ── PNG com 3 subplots ────────────────────────────────────────────
         categoria  = cl.get('categoria', '?')
@@ -788,14 +1107,16 @@ def visualize_cracks(results: list,
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         fig.suptitle(titulo, fontsize=9)
 
-        sc0 = axes[0].scatter(xyz[:,0], xyz[:,1], c=score,
+        # Projeção XZ: X horizontal (largura da parede), Z vertical (altura)
+        # Vista frontal — revela rachaduras verticais/horizontais na face da parede
+        sc0 = axes[0].scatter(xyz[:,0], xyz[:,2], c=score,
                               cmap='RdYlGn_r', s=0.5, alpha=0.8,
                               vmin=0, vmax=1)
         axes[0].set_title('Score de anomalia (vermelho = alto)')
         plt.colorbar(sc0, ax=axes[0])
 
         c_pred = np.where(pred, 'red', 'lightgray')
-        axes[1].scatter(xyz[:,0], xyz[:,1], c=c_pred, s=0.5, alpha=0.7)
+        axes[1].scatter(xyz[:,0], xyz[:,2], c=c_pred, s=0.5, alpha=0.7)
         axes[1].set_title('Avarias preditas (vermelho)')
 
         for mask, col, lbl in [
@@ -805,13 +1126,16 @@ def visualize_cracks(results: list,
             (fn,          'blue',      f'Não detectado (FN) — {fn.sum():,}'),
         ]:
             if mask.sum() > 0:
-                axes[2].scatter(xyz[mask,0], xyz[mask,1],
+                axes[2].scatter(xyz[mask,0], xyz[mask,2],
                                 c=col, s=0.5, alpha=0.7, label=lbl)
         axes[2].legend(markerscale=6, fontsize=7)
         axes[2].set_title('TP / FP / FN')
 
         for ax in axes:
-            ax.set_aspect('equal'); ax.axis('off')
+            ax.set_aspect('equal')
+            ax.set_xlabel('X (m)', fontsize=7)
+            ax.set_ylabel('Z (m)', fontsize=7)
+            ax.tick_params(labelsize=6)
 
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f'{fname}_avarias_{ts}.png'),
@@ -911,4 +1235,136 @@ def plot_score_distribution(results: list, thr: float,
     plt.close()
 
 
+# ============================================================================
+# ABLATION E COMPARAÇÃO DE MODELOS
+# ============================================================================
+
+def evaluate_ablation(
+    results_raw: list,
+    sf_applied: bool = False,
+) -> pd.DataFrame:
+    """
+    Avalia contribuição marginal de cada componente do v2.
+    Recebe results já com 'score', 'scalar_field', 'gt_labels'.
+    Retorna DataFrame para tabela de ablation do TCC.
+
+    Configs testadas:
+      distill_only   : score bruto sem gate nem fusion
+      distill+gate   : score * soft_weight (gate soft GMM)
+      distill+fusion : 0.7*score + 0.3*sf_gmm
+      v2_completo    : fusion + gate soft
+    """
+    import copy
+
+    configs = [
+        {'name': 'distill_only',    'fusion': False, 'gate': False},
+        {'name': 'distill+gate',    'fusion': False, 'gate': True },
+        {'name': 'distill+fusion',  'fusion': True,  'gate': False},
+        {'name': 'v2_completo',     'fusion': True,  'gate': True },
+    ]
+
+    rows = []
+    for cfg in configs:
+        res = copy.deepcopy(results_raw)
+
+        for r in res:
+            sf_raw = r.get('scalar_field')
+            score  = r['score'].copy()
+
+            if sf_raw is not None:
+                gmm = ScalarFieldGMM(sf_raw).fit()
+                sf_prob = gmm.anomaly_probability()
+                soft_w  = gmm.soft_weights()
+
+                if cfg['fusion']:
+                    lo, hi = score.min(), score.max()
+                    dist_n = (score - lo) / (hi - lo + 1e-8)
+                    score  = 0.7 * dist_n + 0.3 * sf_prob
+
+                if cfg['gate']:
+                    score = score * soft_w
+
+            r['score'] = score
+
+        thr, _ = fit_gmm_threshold(res)
+        res     = apply_threshold(res, thr)
+        m       = evaluate(res)
+
+        rows.append({
+            'config'           : cfg['name'],
+            'threshold'        : round(thr, 6),
+            'precision'        : round(m.get('precision', 0), 4),
+            'recall'           : round(m.get('recall', 0), 4),
+            'f1'               : round(m.get('f1', 0), 4),
+            'f1_macro'         : round(m.get('f1_macro', 0), 4),
+            'iou'              : round(m.get('iou', 0), 4),
+            'auroc'            : round(m.get('auroc', 0), 4),
+            'average_precision': round(m.get('average_precision', 0), 4),
+        })
+
+    df = pd.DataFrame(rows)
+    log.info("\nAblation study:\n" + df.to_string(index=False))
+    return df
+
+
+def compare_models(
+    results_v1: list,
+    results_v2: list,
+    results_unsup: list,
+    output_dir: str,
+    ts: str = None,
+) -> pd.DataFrame:
+    """
+    Compara métricas entre v1, v2 e unsup.
+    Exporta CSV e executa Wilcoxon pareado entre os três.
+
+    Args:
+        results_v1/v2/unsup : listas com 'pred_labels', 'gt_labels', 'score', 'has_crack'
+        output_dir          : diretório para salvar o CSV
+        ts                  : timestamp para nome do arquivo
+
+    Returns:
+        DataFrame com métricas agregadas por modelo.
+    """
+    if ts is None:
+        ts = datetime.now().strftime('%d%m%Y_%H%M')
+
+    model_results = {
+        'v1'   : results_v1,
+        'v2'   : results_v2,
+        'unsup': results_unsup,
+    }
+
+    rows = []
+    per_cloud_scores = {name: [] for name in model_results}
+
+    for name, res in model_results.items():
+        m = evaluate(res)
+        rows.append({
+            'model'            : name,
+            'precision'        : round(m.get('precision', 0), 4),
+            'recall'           : round(m.get('recall', 0), 4),
+            'f1'               : round(m.get('f1', 0), 4),
+            'f1_macro'         : round(m.get('f1_macro', 0), 4),
+            'iou'              : round(m.get('iou', 0), 4),
+            'auroc'            : round(m.get('auroc', 0), 4),
+            'average_precision': round(m.get('average_precision', 0), 4),
+            'chamfer_distance' : round(m.get('chamfer_distance', float('nan')), 8),
+        })
+        per_cloud_scores[name] = [
+            pc['f1'] for pc in m.get('per_cloud', [])
+        ]
+
+    df = pd.DataFrame(rows)
+
+    # Wilcoxon pareado
+    stat_results = statistical_comparison(per_cloud_scores, metric='f1')
+
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, f'model_comparison_{ts}.csv')
+    df.to_csv(csv_path, index=False)
+    log.info(f"Comparação de modelos salva: {csv_path}")
+    log.info("\nComparação de modelos:\n" + df.to_string(index=False))
+
+    return df
 

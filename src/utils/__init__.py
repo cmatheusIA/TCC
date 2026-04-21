@@ -54,7 +54,10 @@ from utils.evaluation import (
     classify_crack,
     calibrate_threshold_f1, calibrate_threshold_gmean, calibrate_threshold_fbeta,
     apply_spatial_coherence,
+    compute_crack_sf_interval, apply_scalar_field_gate,
     visualize_cracks,
     CRACK_CATEGORIES, ABNT_LIMITS_MM, CAA_PROJETO,
+    ScalarFieldGMM, save_colored_ply,
+    evaluate_ablation, compare_models,
 )
 

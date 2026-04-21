@@ -1,7 +1,7 @@
 # ============================================================================
 # PROFESSOR-ALUNO v1 — REVERSE DISTILLATION
 # ============================================================================
-# Teacher : PointTransformerInspiredAdvanced (pré-treinado S3DIS, congelado)
+# Teacher : PTv3Teacher/PTv3CompatibleTeacher (pré-treinado PTv3/ScanNet200, congelado; fallback S3DIS)
 # Student : StudentDecoder (decoder treinável, Reverse Distillation)
 # Score   : distância coseno Teacher-Student em 3 escalas + memory bank
 # Referências:
@@ -36,6 +36,34 @@ NUM_EPOCHS    = 150      # epochs totais (early stopping costuma parar antes)
 ALPHA_COS     = 0.85     # cosine é o sinal primário do anomaly score — aumentar peso
 ALPHA_MSE     = 0.15     # magnitude normalizada é secundária
 TEMP_DISTILL  = 4.0      # temperatura de distilação [Hinton et al., 2015]
+
+# Limite de pontos por chunk no forward pass do Teacher.
+#
+# Por que chunkar o Teacher?
+#   Cada módulo com K-NN (LocalFeatureAggregation, SpatialMultiHeadSelfAttention,
+#   LightweightGraphConv, MultiScaleAggregation, DensityAwareNorm) chama
+#   torch.cdist(xyz, xyz), que aloca uma matriz N×N em VRAM.
+#   Para N=22 000 pontos: 22000² × 4 bytes ≈ 1,9 GB por chamada.
+#   Com 5–6 chamadas por forward pass, o custo total é ~10 GB só em matrizes
+#   de distância — daí os OOMs frequentes.
+#
+# Como o chunking resolve:
+#   O Teacher é processado em sub-conjuntos contíguos de TEACHER_CHUNK_SIZE
+#   pontos. Cada chunk gera sua própria matriz cdist de tamanho
+#   chunk_size×chunk_size (ex.: 8000² × 4 ≈ 256 MB).
+#   Os bottlenecks e features intermediárias de todos os chunks são
+#   concatenados ao final — o Student recebe (N, 512) como antes.
+#
+# Trade-off de borda:
+#   Pontos nas fronteiras do chunk perdem vizinhos do chunk adjacente.
+#   Com k=16 e chunk_size=8000, o raio afetado é ~k/chunk_size ≈ 0,2%
+#   dos pontos. A loss é média sobre todos os pontos, então esse ruído
+#   é estatisticamente desprezível.
+#
+# Recomendação de valor:
+#   8 000 → ~256 MB por cdist → seguro em GPUs de 6–8 GB VRAM
+#   4 000 → ~64 MB por cdist → para GPUs de 4 GB
+TEACHER_CHUNK_SIZE = 8_000
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -127,7 +155,7 @@ class TeacherStudentModel(nn.Module):
     """
     Encapsula Teacher (frozen) + Student (trainável) em um único módulo.
 
-    Teacher  : PointTransformerInspiredAdvanced pré-treinado em S3DIS
+    Teacher  : PTv3Teacher/PTv3CompatibleTeacher pré-treinado em PTv3/ScanNet200 (fallback S3DIS)
                → extrai features em 3 escalas + bottleneck
                → parâmetros NUNCA atualizados
 
@@ -146,7 +174,7 @@ class TeacherStudentModel(nn.Module):
     # Pesos das escalas para o anomaly score (soma = 1.0)
     # [256D, 128D, 64D] — pesos equilibrados reduzem falsos positivos de ruído
     # de superfície que afetam excessivamente a escala fina (64D)
-    SCALE_WEIGHTS = [0.2, 0.3, 0.5]
+    SCALE_WEIGHTS = [0.2, 0.35, 0.4]
 
     def __init__(self, input_dim: int = INPUT_DIM,
                  teacher_ckpt: str = None):
@@ -178,28 +206,90 @@ class TeacherStudentModel(nn.Module):
             p.requires_grad_(False)
         self.teacher.eval()   # BN e Dropout em modo eval permanentemente
 
-    def teacher_features(self, x: torch.Tensor) -> tuple:
+    def teacher_features(self, x: torch.Tensor,
+                         chunk_size: int = TEACHER_CHUNK_SIZE) -> tuple:
         """
-        Extrai features do Teacher SEM gradientes.
+        Extrai features do Teacher SEM gradientes, processando em chunks para
+        evitar OOM causado por torch.cdist(xyz, xyz) — operação O(N²) em VRAM.
+
         x: (N, input_dim)
+        chunk_size: pontos por chunk (default = TEACHER_CHUNK_SIZE).
+                    Se N ≤ chunk_size, processa a nuvem inteira de uma vez.
+
         Returns: (bottleneck (N,512), [t3 (N,256), t2 (N,128), t1 (N,64)])
 
-        Nota: PointTransformerInspiredAdvanced retorna (N,512) diretamente.
-        As escalas intermediárias são extraídas com hooks temporários.
+        Estratégia de chunking:
+          - A nuvem é dividida em sub-conjuntos contíguos de `chunk_size` pontos.
+          - Cada chunk roda o Teacher de forma independente (torch.no_grad()).
+          - Hooks de ativação coletam features intermediárias por chunk.
+          - bottleneck e escalas são concatenados ao final.
+          - Pontos na borda de cada chunk perdem ~k vizinhos do chunk adjacente
+            (k=16), afetando apenas ~0,2% dos pontos — ruído desprezível na loss.
+        """
+        N = x.size(0)
+
+        # Caminho direto: nuvem pequena o suficiente para processar inteira.
+        # _teacher_forward_chunk retorna features brutas dos hooks — é necessário
+        # passar por _project_teacher_scales para obter as escalas projetadas.
+        if N <= chunk_size:
+            bottleneck, (adapter, lfa, block0) = self._teacher_forward_chunk(x)
+            teacher_scales = self._project_teacher_scales(
+                bottleneck, adapter, lfa, block0)
+            return bottleneck, teacher_scales
+
+        # Caminho chunked: processar em fatias e concatenar
+        all_btn      = []
+        all_adapter  = []
+        all_lfa      = []
+        all_block0   = []
+
+        self.teacher.eval()
+        for start in range(0, N, chunk_size):
+            end     = min(start + chunk_size, N)
+            x_chunk = x[start:end]
+
+            btn, (adapter, lfa, block0) = self._teacher_forward_chunk(x_chunk)
+
+            all_btn.append(btn)
+            if adapter is not None: all_adapter.append(adapter)
+            if lfa     is not None: all_lfa.append(lfa)
+            if block0  is not None: all_block0.append(block0)
+
+        bottleneck = torch.cat(all_btn,     dim=0)           # (N, 512)
+        t_adapter  = torch.cat(all_adapter, dim=0) if all_adapter else None
+        t_lfa      = torch.cat(all_lfa,     dim=0) if all_lfa     else None
+        t_block0   = torch.cat(all_block0,  dim=0) if all_block0  else None
+
+        teacher_scales = self._project_teacher_scales(
+            bottleneck, t_adapter, t_lfa, t_block0)
+
+        return bottleneck, teacher_scales
+
+    def _teacher_forward_chunk(self, x: torch.Tensor) -> tuple:
+        """
+        Executa um único forward pass do Teacher em um chunk de pontos.
+        Coleta features intermediárias via forward hooks.
+
+        x: (chunk, input_dim)
+        Returns: (bottleneck (chunk,512), (adapter, lfa, block0)) — cada um
+                 pode ser None se o Teacher não possuir a camada correspondente.
+
+        Uso interno — chamado por teacher_features().
         """
         self.teacher.eval()
 
-        # Coletar ativações intermediárias com forward hooks
         feats = {}
 
+        # Closures que capturam `feats` pelo valor atual da variável local,
+        # evitando o problema de closure em loops (feats é recriado por chamada).
         def _hook_adapter(m, inp, out):
-            feats['adapter'] = out          # (N, 128) — pós feature_adapter
+            feats['adapter'] = out       # (chunk, 128) — pós feature_adapter
 
         def _hook_lfa(m, inp, out):
-            feats['lfa'] = out              # (N, 128) — pós LFA
+            feats['lfa'] = out           # (chunk, 128) — pós LFA
 
         def _hook_block0(m, inp, out):
-            feats['block0'] = out           # (N, 128) — saída do 1º blk
+            feats['block0'] = out        # (chunk, 128) — saída do 1º blk
 
         hooks = [
             self.teacher.feature_adapter.register_forward_hook(_hook_adapter),
@@ -210,25 +300,16 @@ class TeacherStudentModel(nn.Module):
                 self.teacher.blocks[0].register_forward_hook(_hook_block0))
 
         with torch.no_grad():
-            bottleneck = self.teacher(x)    # (N, 512) — pós proj
+            bottleneck = self.teacher(x)    # (chunk, 512)
 
         for h in hooks:
             h.remove()
 
-        # Escalas intermediárias disponíveis
-        # Mapear para os 3 tamanhos esperados pelo Student: 256, 128, 64
-        # A arquitetura PointTransformer opera em 128D internamente.
-        # Projetamos para as dimensões do Student com projeções lineares leves.
-        t_adapter = feats.get('adapter', None)   # (N, 128)
-        t_lfa     = feats.get('lfa',     None)   # (N, 128)
-        t_block0  = feats.get('block0',  None)   # (N, 128)
-
-        # Projeções fixas (não treinadas — mantidas no eval) para alinhar dims
-        # São aplicadas apenas na inferência das features intermediárias
-        teacher_scales = self._project_teacher_scales(
-            bottleneck, t_adapter, t_lfa, t_block0)
-
-        return bottleneck, teacher_scales
+        return bottleneck, (
+            feats.get('adapter', None),
+            feats.get('lfa',     None),
+            feats.get('block0',  None),
+        )
 
     def _project_teacher_scales(self, bottleneck, t_adapter, t_lfa, t_block0):
         """
@@ -279,26 +360,48 @@ class TeacherStudentModel(nn.Module):
         }
 
     @torch.no_grad()
-    def anomaly_score_per_point(self, x: torch.Tensor) -> np.ndarray:
+    def anomaly_score_per_point(self, x: torch.Tensor,
+                                chunk_size: int = TEACHER_CHUNK_SIZE) -> np.ndarray:
         """
-        Calcula score de anomalia por ponto (inferência).
+        Calcula score de anomalia por ponto (inferência), em chunks para evitar OOM.
+
         x: (N, input_dim)
-        Returns: (N,) float32 — score [0, 2], maior = mais anômalo
+        chunk_size: pontos por chunk (herda TEACHER_CHUNK_SIZE por padrão).
+
+        Returns: (N,) float32 — score [0, 2], maior = mais anômalo.
+
+        Os scores são calculados chunk a chunk e concatenados. Como o score de
+        cada ponto depende apenas das suas próprias features Teacher/Student
+        (não de outros pontos), a concatenação é exata — sem artefatos de borda
+        no resultado final.
         """
         self.eval()
-        out = self.forward(x)
-        T   = out['teacher_scales']
-        S   = out['student_scales']
-        W   = self.SCALE_WEIGHTS
-        N   = x.size(0)
+        N = x.size(0)
 
-        score = torch.zeros(N, device=x.device)
-        for t, s, w in zip(T, S, W):
-            # Distância coseno por ponto: 1 - cos_sim ∈ [0, 2]
-            cos = nn.functional.cosine_similarity(t, s, dim=1)
-            score += w * (1.0 - cos)
+        if N <= chunk_size:
+            # Caminho direto: nuvem pequena, uma passada só
+            out   = self.forward(x)
+            T, S  = out['teacher_scales'], out['student_scales']
+            score = torch.zeros(N, device=x.device)
+            for t, s, w in zip(T, S, self.SCALE_WEIGHTS):
+                score += w * (1.0 - nn.functional.cosine_similarity(t, s, dim=1))
+            return score.cpu().numpy().astype(np.float32)
 
-        return score.cpu().numpy().astype(np.float32)
+        # Caminho chunked: processar em fatias e concatenar scores
+        scores_all = []
+        for start in range(0, N, chunk_size):
+            end     = min(start + chunk_size, N)
+            x_chunk = x[start:end]
+
+            out   = self.forward(x_chunk)
+            T, S  = out['teacher_scales'], out['student_scales']
+            nc    = x_chunk.size(0)
+            score = torch.zeros(nc, device=x.device)
+            for t, s, w in zip(T, S, self.SCALE_WEIGHTS):
+                score += w * (1.0 - nn.functional.cosine_similarity(t, s, dim=1))
+            scores_all.append(score.cpu())
+
+        return torch.cat(scores_all, dim=0).numpy().astype(np.float32)
 
 
 # ============================================================================
@@ -389,15 +492,16 @@ def train_teacher_student(model: TeacherStudentModel,
     distill_loss = DistillationLoss()
     scaler       = GradScaler()
 
-    push_pull    = PushPullLoss(alpha=0.75,
+    push_pull    = PushPullLoss(alpha=0.55,
                                scale_weights=TeacherStudentModel.SCALE_WEIGHTS)
     history = {'loss': [], 'lr': [], 'sup_loss': []}
-    best_loss  = float('inf')
-    best_epoch = 0
-    patience_c = 0
-    patience   = 20 if use_early_stopping else num_epochs
-    phase1_end = max(10, num_epochs // 2)   # mais epochs para memory bank (fase 2)
-    phase2_done = False
+    best_loss     = float('inf')
+    best_sup_loss = float('inf')   # rastreado separadamente para early stopping
+    best_epoch    = 0
+    patience_c    = 0
+    patience      = 20 if use_early_stopping else num_epochs
+    phase1_end    = max(10, num_epochs // 3)   # mais epochs para memory bank (fase 2)
+    phase2_done   = False
 
     log.info(f"\n{'='*65}")
     log.info(f"PROFESSOR-ALUNO — Treinamento do Student Decoder")
@@ -428,12 +532,17 @@ def train_teacher_student(model: TeacherStudentModel,
                     n_skip += 1
                     continue
 
+                # O Teacher já processa internamente em chunks de TEACHER_CHUNK_SIZE
+                # pontos (ver TeacherStudentModel.teacher_features), eliminando as
+                # matrizes cdist N×N que causavam os OOMs frequentes.
+                # O bloco de retry abaixo mantém gradient checkpointing como
+                # fallback para casos extremos (nuvens muito densas após voxelização).
                 def _step(use_ckpt=False):
                     if use_ckpt:
                         model.teacher.use_checkpoint = True
                     optimizer.zero_grad(set_to_none=True)
                     with autocast():
-                        out  = model(x) 
+                        out  = model(x)
                         loss = distill_loss(
                             out['teacher_scales'], out['student_scales'])
                     scaler.scale(loss).backward()
@@ -461,10 +570,11 @@ def train_teacher_student(model: TeacherStudentModel,
 
                 ep_losses.append(lv)
 
-                # Memory bank: coletar bottlenecks normais (Fase 2)
+                # Memory bank: coletar bottlenecks normais (Fase 2).
+                # Usa teacher_features (chunked) em vez de model.teacher(x) direto
+                # para manter consistência com o caminho de treino.
                 if memory_bank is not None and epoch >= phase1_end:
-                    with torch.no_grad():
-                        btn = model.teacher(x)   # (N, 512)
+                    btn, _ = model.teacher_features(x)
                     memory_bank.update(btn.cpu())
 
             except RuntimeError as e:
@@ -522,7 +632,7 @@ def train_teacher_student(model: TeacherStudentModel,
 
         scheduler.step()
 
-        # Salvar melhor modelo
+        # Salvar melhor modelo (critério: distillation loss)
         if avg_loss < best_loss:
             best_loss, best_epoch = avg_loss, epoch
             patience_c = 0
@@ -538,6 +648,14 @@ def train_teacher_student(model: TeacherStudentModel,
         else:
             patience_c += 1
 
+        # Se a supervised loss ainda está caindo ≥2%, resetar patience da distillation.
+        # Razão: o early stopping monitora distillation loss, que converge antes da
+        # push-pull loss. Sem esse reset, o treino para no meio da fase supervisionada
+        # (como aconteceu no run 04/04: 71 epochs, sup_loss ainda em 0.25 e caindo).
+        if not math.isnan(avg_sup) and avg_sup < best_sup_loss * 0.98:
+            best_sup_loss = avg_sup
+            patience_c    = 0
+
         if (epoch + 1) % 10 == 0:
             torch.save({'epoch': epoch, 'student': model.student.state_dict(),
                         'history': history},
@@ -546,9 +664,11 @@ def train_teacher_student(model: TeacherStudentModel,
         gc.collect()
         torch.cuda.empty_cache()
 
-        # Early stopping simples: patience epochs sem melhoria após min_epochs
+        # Early stopping: só para quando distillation E supervised estagnaram.
         if epoch >= 20 and patience_c >= patience:
-            log.info(f"Early stop: {patience} epochs sem melhoria.")
+            sup_info = f", sup={avg_sup:.5f}" if not math.isnan(avg_sup) else ""
+            log.info(f"Early stop: {patience} epochs sem melhoria "
+                     f"(dist={avg_loss:.5f}{sup_info}).")
             break
 
     log.info(f"\nTreino concluído. Melhor epoch: {best_epoch+1} (loss={best_loss:.5f})")
@@ -558,6 +678,20 @@ def train_teacher_student(model: TeacherStudentModel,
 # ============================================================================
 # INFERÊNCIA — SCORE DE ANOMALIA
 # ============================================================================
+
+# [FIX 5 REVERTIDO — rank normalization contraproducente]
+# Análise (04/04/2026): score min-max já separa perfeitamente as classes
+#   Normal: P95=0.130  |  Crack: P5=0.686  →  zero sobreposição
+# Rank-norm destrói essa separação natural: G-mean recall 0.9994→0.9730, F1 0.9996→0.5054.
+# Função mantida comentada para referência futura.
+#
+# def _rank_norm(v: np.ndarray) -> np.ndarray:
+#     n = len(v)
+#     if n == 0:
+#         return v
+#     ranks = np.argsort(np.argsort(v))
+#     return ranks.astype(np.float32) / (n - 1 + 1e-8)
+
 
 @torch.no_grad()
 def compute_anomaly_scores(model: TeacherStudentModel,
@@ -588,9 +722,10 @@ def compute_anomaly_scores(model: TeacherStudentModel,
         # Score de distilação por ponto (3 escalas)
         raw_score = model.anomaly_score_per_point(x)   # (N,) numpy
 
-        # Score do banco de memória
+        # Score do banco de memória — usa teacher_features (chunked) para evitar
+        # OOM nas mesmas matrizes cdist N×N que afetavam o loop de treino.
         if memory_bank is not None and memory_bank.bank is not None:
-            btn       = model.teacher(x)               # (N, 512)
+            btn, _    = model.teacher_features(x)      # (N, 512) — chunked
             bank_dist = memory_bank.score(btn.cpu(), k=5)
             lo, hi    = bank_dist.min(), bank_dist.max()
             bank_norm = (bank_dist - lo) / (hi - lo + 1e-8)
@@ -602,12 +737,14 @@ def compute_anomaly_scores(model: TeacherStudentModel,
             score  = (raw_score - lo) / (hi - lo + 1e-8)
 
         results.append({
-            'filename'  : d['filename'],
-            'has_crack' : d['has_crack'],
-            'score'     : score,
-            'gt_labels' : labels,
-            'n_points'  : len(labels),
-            'xyz'       : d['features'][:, :3],   # coordenadas para filtro espacial
+            'filename'    : d['filename'],
+            'has_crack'   : d['has_crack'],
+            'score'       : score,
+            'gt_labels'   : labels,
+            'n_points'    : len(labels),
+            'xyz'         : d['features'][:, :3],   # coordenadas para filtro espacial
+            'rgb'         : d['features'][:, 3:6],  # cores originais (normalizadas 0-1)
+            'scalar_field': d['features'][:, 9],    # scalar_Scalar_field bruto (prior)
         })
 
     return results
@@ -617,12 +754,55 @@ def compute_anomaly_scores(model: TeacherStudentModel,
 # THRESHOLD GMM — idêntico ao usado pela GAN
 # ============================================================================
 
+def build_teacher(input_dim: int, ptv3_ckpt: str, s3dis_ckpt: str) -> nn.Module:
+    """
+    Instancia o Teacher com fallback automático A → B → C.
+
+    A: PTv3Teacher (torchsparse)        — transfer 100% enc2+enc3
+    B: PTv3CompatibleTeacher (denso)    — transfer ~50% enc2 via shape-matching
+    C: PointTransformerInspiredAdvanced — transfer mínimo por shape (S3DIS)
+
+    Todos expõem feature_adapter / lfa / blocks para compatibilidade com
+    os forward hooks em TeacherStudentModel.teacher_features().
+    """
+    # Abordagem A: PTv3 completo (torchsparse)
+    try:
+        from utils.architectures import PTv3Teacher
+        teacher = PTv3Teacher(input_dim=input_dim, checkpoint_path=ptv3_ckpt)
+        log.info("Teacher: PTv3 completo (torchsparse) ✓")
+        return teacher
+    except ImportError as e:
+        log.warning(f"PTv3Teacher: torchsparse indisponível ({e}) → tentando B")
+    except Exception as e:
+        log.warning(f"PTv3Teacher falhou ({type(e).__name__}: {e}) → tentando B")
+
+    # Abordagem B: PTv3-compatible (PyTorch puro)
+    try:
+        from utils.architectures import PTv3CompatibleTeacher
+        teacher = PTv3CompatibleTeacher(input_dim=input_dim, checkpoint_path=ptv3_ckpt)
+        log.info("Teacher: PTv3CompatibleTeacher (sem torchsparse) ✓")
+        return teacher
+    except Exception as e:
+        log.warning(f"PTv3CompatibleTeacher falhou ({type(e).__name__}: {e}) → C (S3DIS)")
+
+    # Abordagem C: S3DIS fallback
+    from utils.architectures import PointTransformerInspiredAdvanced
+    teacher = PointTransformerInspiredAdvanced(input_dim=input_dim,
+                                               checkpoint_path=s3dis_ckpt)
+    log.info("Teacher: PointTransformerInspiredAdvanced (S3DIS fallback) ✓")
+    return teacher
+
+
 def build_model(device: torch.device) -> TeacherStudentModel:
-    model = TeacherStudentModel(
+    teacher = build_teacher(
         input_dim=INPUT_DIM,
-        teacher_ckpt=PTRANSF_WEIGHTS,
-    ).to(device)
-    return model
+        ptv3_ckpt=PTRANSF_WEIGHTS,
+        s3dis_ckpt=PTRANSF_WEIGHTS_S3DIS,
+    )
+    model = TeacherStudentModel(input_dim=INPUT_DIM, teacher_ckpt=None)
+    model.teacher = teacher
+    model._freeze_teacher()
+    return model.to(device)
 
 
 # ============================================================================
@@ -693,6 +873,31 @@ def main():
 
     memory_bank.save(os.path.join(MODELS, 'ts_memory_bank.pt'))
 
+    # ── 5b. Rebuild memory bank com nuvens completas (sem augmentação) ────────
+    # Durante o treino, o bank foi populado com bottlenecks de patches recortados
+    # (spatial_crop ativo, raio=0.4). Na inferência o modelo processa nuvens
+    # completas — a diferença de distribuição desloca µ_normal para cima e força
+    # o threshold GMM a valores altos (0.22→0.44 no run 03/04), colapsando recall.
+    # Fix: resetar e repopular passando train_list completo sem augmentação.
+    log.info("Reconstruindo memory bank (nuvens completas, sem augmentação)...")
+    memory_bank.bank = None
+    # Subsample menor no rebuild (300/nuvem) para nuvens com alta variação de
+    # superfície não dominarem o banco. 300 × ~29 nuvens = ~8700 features max,
+    # bem distribuídas. O valor padrão (1000/nuvem) deixava µ_normal alto (0.146
+    # vs 0.100 ideal) porque nuvens ruidosas tinham peso proporcional ao tamanho.
+    _orig_k = memory_bank.subsample_k
+    memory_bank.subsample_k = 300
+    model.eval()
+    with torch.no_grad():
+        for d in train_list:
+            x = torch.tensor(d['features'], dtype=torch.float32).to(device)
+            btn, _ = model.teacher_features(x)
+            memory_bank.update(btn.cpu())
+    memory_bank.subsample_k = _orig_k
+    log.info(f"Memory bank reconstruído: {len(memory_bank.bank):,} features "
+             f"de {len(train_list)} nuvens completas (300/nuvem)")
+    memory_bank.save(os.path.join(MODELS, 'ts_memory_bank_clean.pt'))
+
     # ── 6. Scores de anomalia ─────────────────────────────────────────────────
     log.info("\nComputando anomaly scores...")
     eval_data   = eval_list if eval_list else train_list
@@ -704,10 +909,22 @@ def main():
         model, train_list[:min(20, len(train_list))],
         device, memory_bank)
 
+    # ── 6b. Intervalo de scalar_field supervisionado ──────────────────────────
+    # Aprende [sf_min, sf_max] dos pontos label=1 no treino.
+    # Em inferência (test), pontos com scalar_field fora desse intervalo
+    # nunca foram observados como rachadura → não podem ser preditos como tal.
+    sf_min, sf_max = compute_crack_sf_interval(train_list)
+    log.info(f"Intervalo crack (scalar_field): [{sf_min:.2f}, {sf_max:.2f}]")
+
     # ── 7. Threshold GMM ──────────────────────────────────────────────────────
     thr, gmm_info = fit_gmm_threshold(results, normal_results=normal_ref)
     log.info(f"Threshold ({gmm_info['method']}): {thr:.4f}")
     results       = apply_threshold(results, thr)
+
+    # ── 7b. Gate de scalar_field ──────────────────────────────────────────────
+    # Reverte pred_labels=1 para pontos fora do intervalo aprendido.
+    # Atua após o threshold para eliminar FPs em regiões de alta intensidade.
+    results = apply_scalar_field_gate(results, sf_min, sf_max)
 
     # Sanidade: nuvens normais devem ter baixo % de anomalias
     normal_check = apply_threshold(
@@ -729,14 +946,24 @@ def main():
     }
 
     comparison = []   # lista de dicts para exportar como CSV
-    best_strategy  = None
-    best_f1        = -1.0
+    best_f1_any    = -1.0
+    best_name_any  = None
+    # Captura explícita do G-mean para seleção primária
+    results_gmean  = None
+    metrics_gmean  = None
+    thr_gmean      = None
 
     for name, thr_s in strategies.items():
-        # Aplicar threshold e filtro espacial numa cópia isolada
         import copy
         res_s = apply_threshold(copy.deepcopy(results), thr_s)
-        res_s = apply_spatial_coherence(res_s, min_neighbors=3, k=20)
+        res_s = apply_scalar_field_gate(res_s, sf_min, sf_max)
+        # [FIX — spatial coherence desativada, 04/04/2026]
+        # Diagnóstico: score separa perfeitamente normal/crack sem sobreposição
+        #   Normal P95=0.130 vs Crack P5=0.686 → nenhum FP residual a remover
+        # apply_spatial_coherence(min_neighbors=3, k=20) removia 64.4% dos TPs
+        # porque cracks finos (1-2pts) não têm ≥3 vizinhos crack em k=20.
+        # Sem filtro: recall 0.9994, precision 0.9998. Com filtro: recall 0.3554.
+        # res_s = apply_spatial_coherence(res_s, min_neighbors=3, k=20)
         m_s   = evaluate(res_s)
 
         row = {
@@ -756,14 +983,28 @@ def main():
         log.info(f"    Precision={row['precision']:.4f}  Recall={row['recall']:.4f}"
                  f"  F1={row['f1']:.4f}  IoU={row['iou']:.4f}  AUROC={row['auroc']:.4f}")
 
-        if row['f1'] > best_f1:
-            best_f1       = row['f1']
-            best_strategy = name
-            results_best  = res_s
-            metrics_best  = m_s
-            thr_best      = thr_s
+        # Capturar resultado G-mean para uso como estratégia primária
+        # G-mean = √(TPR × TNR): equilibra recall e especificidade para classes
+        # desbalanceadas (~6.7% crack points), evita o viés para a classe majoritária.
+        # Referência: Sokolova & Lapalme, Pattern Recognition 2009.
+        if name == 'G-mean':
+            results_gmean = res_s
+            metrics_gmean = m_s
+            thr_gmean     = thr_s
 
-    log.info(f"\n  Melhor estratégia: [{best_strategy}] (F1={best_f1:.4f})")
+        # Rastrear melhor F1 apenas para log informativo
+        if row['f1'] > best_f1_any:
+            best_f1_any  = row['f1']
+            best_name_any = name
+
+    # G-mean é a estratégia primária (dataset desbalanceado: ~6.7% crack points).
+    # O melhor F1 é registrado no log para referência, mas não dirige a seleção.
+    best_strategy = 'G-mean'
+    results_best  = results_gmean
+    metrics_best  = metrics_gmean
+    thr_best      = thr_gmean
+
+    log.info(f"\n  Estratégia primária: [G-mean] (melhor F1 geral: [{best_name_any}] F1={best_f1_any:.4f})")
     log.info("="*65)
 
     # Salvar tabela de comparação

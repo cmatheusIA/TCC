@@ -426,6 +426,346 @@ class LocalFeatureAggregation(nn.Module):
         return (enc * w).sum(1)
 
 
+# ============================================================================
+# PTv3-COMPATIBLE BLOCK — bloco de atenção compatível com enc2 do PTv3
+# ============================================================================
+
+class PTv3CompatibleBlock(nn.Module):
+    """
+    Replica a estrutura de enc2 do PTv3 sem sparse ops.
+
+    Pesos carregáveis do checkpoint enc2 via _selective_load (shape fallback):
+      attn_qkv  (384,128), attn_proj (128,128)
+      fc1       (512,128), fc2       (128,512)
+      norm1     (128,),    norm2     (128,)
+
+    CPE (Conditional Positional Encoding): o original usa sparse conv
+    (128,3,3,3,128). Aqui substituído por Linear sobre k-NN mean aggregate.
+    Treinado do zero — não carrega pesos do checkpoint.
+
+    Referência: Wu et al., PTv3 (CVPR 2024 Oral, arXiv:2312.10035)
+    """
+
+    def __init__(self, d_model: int = 128, n_heads: int = 8, k_neighbors: int = 16):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model deve ser divisível por n_heads"
+        self.d_model  = d_model
+        self.n_heads  = n_heads
+        self.d_head   = d_model // n_heads
+        self.k        = k_neighbors
+
+        # CPE dense (substitui sparse conv 128×3×3×3×128)
+        self.cpe_linear = nn.Linear(d_model, d_model)
+        self.cpe_norm   = nn.LayerNorm(d_model)
+
+        # Self-attention com QKV combinado (enc2.block*.attn.*)
+        self.norm1     = nn.LayerNorm(d_model)
+        self.attn_qkv  = nn.Linear(d_model, 3 * d_model)   # → (384, 128)
+        self.attn_proj = nn.Linear(d_model, d_model)        # → (128, 128)
+
+        # FFN 4× expansion (enc2.block*.mlp.0.*)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.fc1   = nn.Linear(d_model, 4 * d_model)        # → (512, 128)
+        self.fc2   = nn.Linear(4 * d_model, d_model)        # → (128, 512)
+        self.act   = nn.GELU()
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
+        """
+        x:   (N, d_model)
+        xyz: (N, 3)
+        Returns: (N, d_model)
+        """
+        N = x.shape[0]
+        k = min(self.k, N)
+
+        # CPE: mean aggregate k vizinhos (scipy cKDTree, O(N log N))
+        xyz_np  = xyz.detach().cpu().numpy()
+        tree    = cKDTree(xyz_np)
+        _, idx  = tree.query(xyz_np, k=k)
+        idx_t   = torch.from_numpy(idx).long().to(x.device)
+        nb_mean = x[idx_t].mean(dim=1)
+        x_cpe   = self.cpe_norm(x + self.cpe_linear(nb_mean))
+
+        # Self-attention (pre-norm, QKV combinado)
+        # F.scaled_dot_product_attention usa Flash Attention (O(N) em VRAM) quando
+        # disponível (PyTorch ≥ 2.0), evitando o matmul N×N explícito que aloca
+        # (n_heads, N, N) — para N=46k em FP16 isso seria ~34 GB.
+        residual = x_cpe
+        h   = self.norm1(x_cpe)
+        qkv = self.attn_qkv(h)
+        qkv = qkv.reshape(N, 3, self.n_heads, self.d_head).permute(1, 2, 0, 3)
+        q, k_t, v = qkv[0], qkv[1], qkv[2]
+        out = F.scaled_dot_product_attention(q, k_t, v, is_causal=False)
+        out = out.permute(1, 0, 2).reshape(N, self.d_model)
+        out  = self.attn_proj(out)
+        x    = residual + out
+
+        # FFN (pre-norm)
+        residual = x
+        h = self.norm2(x)
+        h = self.fc2(self.act(self.fc1(h)))
+        x = residual + h
+
+        return x
+
+
+# ============================================================================
+# PTv3-COMPATIBLE TEACHER — Abordagem B (sem torchsparse)
+# ============================================================================
+
+class PTv3CompatibleTeacher(nn.Module):
+    """
+    Teacher baseado em blocos PTv3-compatible (sem sparse ops).
+
+    Expõe feature_adapter, lfa, blocks para compatibilidade com os forward
+    hooks em TeacherStudentModel.teacher_features() — sem alterar TeacherStudentModel.
+
+    Transfer: _selective_load carrega por shape enc2.block0 → lfa,
+              enc2.block1 → blocks[0]. blocks[1] e blocks[2] inicializam do zero.
+
+    Arquitetura:
+      feature_adapter : Linear(15→64) → LN → ReLU → Linear(64→128)   [do zero]
+      lfa             : PTv3CompatibleBlock(128)  ← enc2.block0 weights
+      blocks[0]       : PTv3CompatibleBlock(128)  ← enc2.block1 weights
+      blocks[1,2]     : PTv3CompatibleBlock(128)  [do zero]
+      proj            : LN → Linear(128→256) → GELU → Linear(256→512)  [do zero]
+    """
+
+    # 'proj' era substring de 'attn_proj' — usar nomes exatos para evitar o match indevido
+    _NEW_LAYERS = ['feature_adapter', 'cpe_linear', 'cpe_norm',
+                   'proj.0', 'proj.1', 'proj.3']   # bottleneck LN + Linear layers
+
+    def __init__(self, input_dim: int = INPUT_DIM, d_model: int = D_MODEL,
+                 num_extra_blocks: int = 3, checkpoint_path: str = None):
+        super().__init__()
+        print(f"\n🧠 PTv3CompatibleTeacher (input={input_dim}D, d_model={d_model}D)")
+
+        # feature_adapter: hook point #1, 15D → 128D
+        self.feature_adapter = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, d_model),
+        )
+
+        # lfa: hook point #2, primeiro bloco PTv3
+        self.lfa = PTv3CompatibleBlock(d_model)
+
+        # blocks: hook #3 em blocks[0], blocos adicionais
+        self.blocks = nn.ModuleList([
+            PTv3CompatibleBlock(d_model) for _ in range(num_extra_blocks)
+        ])
+
+        # proj: bottleneck 128D → 512D
+        self.proj = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model * 2), nn.GELU(),
+            nn.Linear(d_model * 2, 512),
+        )
+
+        self._init_weights()
+
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            self._load_pretrained(checkpoint_path)
+        else:
+            print(f"   ⚠️  Pesos não encontrados: {checkpoint_path}")
+
+        n = sum(p.numel() for p in self.parameters())
+        print(f"   📊 Parâmetros: {n:,}")
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
+
+    def _load_pretrained(self, path: str):
+        print(f"   📦 Carregando: {os.path.basename(path)}")
+        try:
+            ckpt = torch.load(path, map_location='cpu', weights_only=False)
+            sd   = ckpt.get('model_state_dict', ckpt.get('state_dict', ckpt))
+            loaded, skipped_new, shape_miss = _selective_load(
+                self, sd, new_layer_names=self._NEW_LAYERS)
+            total = sum(1 for _ in self.parameters())
+            pct   = loaded / total * 100 if total else 0
+            print(f"   ✅ Transfer: {loaded}/{total} tensores ({pct:.1f}%)")
+            print(f"      Novas (skip): {skipped_new} | Shape mismatch: {shape_miss}")
+        except Exception as e:
+            print(f"   ⚠️  Erro no transfer: {e}")
+
+    def freeze(self):
+        """Congela tudo exceto feature_adapter."""
+        for name, p in self.named_parameters():
+            if 'feature_adapter' not in name:
+                p.requires_grad_(False)
+
+    def unfreeze(self):
+        for p in self.parameters():
+            p.requires_grad_(True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (N, 15) → (N, 512)"""
+        xyz = x[:, :3]
+        x = self.feature_adapter(x)   # (N, 128) — hook 'adapter'
+        x = self.lfa(x, xyz)          # (N, 128) — hook 'lfa'
+        for blk in self.blocks:       # hook 'block0' captura blocks[0]
+            x = blk(x, xyz)
+        return self.proj(x)           # (N, 512)
+
+
+# ============================================================================
+# PTv3 TEACHER — Abordagem A (requer torchsparse)
+# ============================================================================
+
+class PTv3Teacher(nn.Module):
+    """
+    Teacher usando o PTv3 oficial (Pointcept) com torchsparse.
+
+    Levanta ImportError no __init__ se torchsparse não estiver disponível —
+    build_teacher() captura e cai para PTv3CompatibleTeacher (Abordagem B).
+
+    Interface de hooks (compatível com teacher_features()):
+      feature_adapter : Linear(15→128) — chamado no início do forward
+      lfa             : Identity wrapper que recebe enc2 (128D) durante forward
+      blocks[0]       : Linear(256→128) que recebe enc3 e projeta para 128D
+
+    Pesos: PTv3 backbone via _selective_load; feature_adapter/lfa/blocks/proj_head do zero.
+    """
+
+    _NEW_LAYERS = ['feature_adapter', 'lfa', 'blocks', 'proj_head', 'stem_adapter']
+
+    def __init__(self, input_dim: int = INPUT_DIM, checkpoint_path: str = None):
+        # Verificar torchsparse — build_teacher() depende deste ImportError
+        try:
+            import torchsparse
+            from torchsparse import SparseTensor
+            self._torchsparse  = torchsparse
+            self._SparseTensor = SparseTensor
+        except ImportError as e:
+            raise ImportError(f"PTv3Teacher requer torchsparse: {e}") from e
+
+        super().__init__()
+        print(f"\n🚀 PTv3Teacher (torchsparse, input={input_dim}D)")
+
+        # stem_adapter: 15D → 6D para o stem original do PTv3
+        self.stem_adapter = nn.Linear(input_dim, 6)
+
+        # feature_adapter: hook point #1 (15D → 128D)
+        self.feature_adapter = nn.Sequential(
+            nn.Linear(input_dim, 64), nn.LayerNorm(64), nn.ReLU(),
+            nn.Linear(64, 128),
+        )
+
+        # Backbone PTv3 (Pointcept) ou fallback denso
+        self.backbone = self._build_backbone()
+
+        # lfa: hook point #2 — Identity que recebe enc2 (128D)
+        self.lfa = nn.Identity()
+
+        # blocks[0]: hook point #3 — projeta enc3 (256D) → 128D
+        self.blocks = nn.ModuleList([nn.Linear(256, 128)])
+
+        # proj_head: enc3 → bottleneck 512D
+        self.proj_head = nn.Sequential(
+            nn.LayerNorm(256),
+            nn.Linear(256, 512),
+        )
+
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            self._load_pretrained(checkpoint_path)
+        else:
+            print(f"   ⚠️  Pesos não encontrados: {checkpoint_path}")
+
+        n = sum(p.numel() for p in self.parameters())
+        print(f"   📊 Parâmetros: {n:,}")
+
+    def _build_backbone(self):
+        """Tenta importar PTv3 do Pointcept; usa blocos densos como fallback."""
+        try:
+            from model.point_transformer_v3 import PointTransformerV3
+            return PointTransformerV3()
+        except ImportError:
+            import warnings
+            warnings.warn("Pointcept não encontrado — usando backbone denso (4× PTv3CompatibleBlock)")
+            return nn.ModuleList([PTv3CompatibleBlock(128) for _ in range(4)])
+
+    def _dense_to_sparse(self, x_6d: torch.Tensor, xyz: torch.Tensor):
+        SparseTensor = self._SparseTensor
+        coords = (xyz / VOXEL_SIZE).int()
+        batch  = torch.zeros(len(coords), 1, dtype=torch.int, device=coords.device)
+        coords = torch.cat([batch, coords], dim=1)
+        return SparseTensor(feats=x_6d, coords=coords)
+
+    def _load_pretrained(self, path: str):
+        print(f"   📦 Carregando: {os.path.basename(path)}")
+        try:
+            ckpt = torch.load(path, map_location='cpu', weights_only=False)
+            sd   = ckpt.get('model_state_dict', ckpt.get('state_dict', ckpt))
+            loaded, skipped_new, shape_miss = _selective_load(
+                self, sd, new_layer_names=self._NEW_LAYERS)
+            total = sum(1 for _ in self.parameters())
+            pct   = loaded / total * 100 if total else 0
+            print(f"   ✅ Transfer: {loaded}/{total} ({pct:.1f}%)")
+        except Exception as e:
+            print(f"   ⚠️  Erro no transfer: {e}")
+
+    def freeze(self):
+        for name, p in self.named_parameters():
+            if 'feature_adapter' not in name:
+                p.requires_grad_(False)
+
+    def unfreeze(self):
+        for p in self.parameters(): p.requires_grad_(True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (N, 15) → (N, 512)"""
+        xyz = x[:, :3]
+
+        # hook #1: feature_adapter
+        _ = self.feature_adapter(x)
+
+        if isinstance(self.backbone, nn.ModuleList):
+            # Backbone denso (Pointcept não disponível)
+            h = self.feature_adapter(x)
+            for blk in self.backbone:
+                h = blk(h, xyz)
+            enc2_feat = h
+            enc3_feat_256 = torch.cat([h, h], dim=-1)   # 128→256 para simular enc3
+        else:
+            # Backbone PTv3 oficial
+            x_6d   = self.stem_adapter(x)
+            sparse = self._dense_to_sparse(x_6d, xyz)
+            out    = self.backbone(sparse)
+            enc2_feat     = out.get('enc2', out.get('feat', x))
+            enc3_feat_256 = out.get('enc3', enc2_feat)
+            if hasattr(enc2_feat,     'feats'): enc2_feat     = enc2_feat.feats
+            if hasattr(enc3_feat_256, 'feats'): enc3_feat_256 = enc3_feat_256.feats
+            # Garantir N consistente após voxelização
+            enc2_feat     = enc2_feat[:x.shape[0]]
+            enc3_feat_256 = enc3_feat_256[:x.shape[0]]
+
+        # hook #2: lfa recebe enc2 (128D)
+        enc2_feat = self.lfa(enc2_feat)
+
+        # hook #3: blocks[0] projeta enc3 → 128D
+        _ = self.blocks[0](enc3_feat_256)
+
+        # bottleneck: enc3 256D → 512D
+        return self.proj_head(enc3_feat_256)
+
+
 class PointTransformerInspiredAdvanced(nn.Module):
     """
     Discriminador baseado em Point Transformer (Zhao et al., 2021).
