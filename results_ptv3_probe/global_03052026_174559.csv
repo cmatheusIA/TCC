@@ -1,0 +1,2 @@
+versao,macro_f1_mean,macro_f1_std,miou_mean,miou_std,auroc_ovr_mean
+ptv3_probe,0.0474,0.1735,0.0408,0.1734,nan

@@ -64,24 +64,41 @@ warnings.filterwarnings('ignore')
 # Alterar BASE_PATH para o caminho da sua máquina.
 # WSL local  : '/home/<usuario>/tcc'
 # GCP / Colab: '/content/drive/MyDrive/MEU_TCC/TCC 2'
-BASE_PATH       = f'{os.getcwd()}'
+BASE_PATH       = str(Path(__file__).resolve().parents[2])  # src/utils/config.py → TCC/
 DATA_TRAIN      = f'{BASE_PATH}/data/train'
 DATA_TEST       = f'{BASE_PATH}/data/test'
+DATA_TRAIN_ABNT = f'{BASE_PATH}/data_abnt/train'
+DATA_TEST_ABNT  = f'{BASE_PATH}/data_abnt/test'
 PRETRAINED      = f'{BASE_PATH}/pretrained_models'
 VIS_PATH        = f'{BASE_PATH}/visualizations_ts'
 LOG_PATH        = f'{BASE_PATH}/logs_ts'
 
 KPCONV_WEIGHTS        = f'{PRETRAINED}/kpconv_s3dis_202010091238.pth'
-PTRANSF_WEIGHTS       = f'{PRETRAINED}/ptv3_scannet200.pth'            # PTv3 ScanNet200 (tentativa A ou B)
-PTRANSF_WEIGHTS_S3DIS = f'{PRETRAINED}/pointtransformer_s3dis_202109241350utc.pth'  # fallback C
+PTRANSF_WEIGHTS       = f'{PRETRAINED}/ptv3_scannet200.pth'
+PTRANSF_WEIGHTS_S3DIS = f'{PRETRAINED}/pointtransformer_s3dis_202109241350utc.pth'
 
 # ── Hiperparâmetros compartilhados ────────────────────────────────────────────
-INPUT_DIM    = 16      # xyz(3)+rgb(3)+normals(3)+scalar(1)+curv(1)+dens(1)+var(1)+sv(1)+lum(1)+sat(1)
+INPUT_DIM    = 18      # xyz(3)+rgb(3)+normals(3)+scalar(1)+curv(1)+dens(1)+var(1)+sv(1)+lum(1)+sat(1)+z_score(1)+gradient_mag(1)
+INPUT_DIM_V2 = INPUT_DIM  # alias de compatibilidade
 D_MODEL      = 128     # dimensão interna do PointTransformer
 NUM_HEADS    = 8       # cabeças de atenção
 NUM_LAYERS   = 4       # blocos transformer
+
+# ── Classificação multiclasse ABNT NBR 6118 ──────────────────────────────────
+# Labels armazenados como 0-indexed (0–4) após remapeamento de 1–5 do label_converter.
+NUM_CLASSES  = 5
+CLASS_NAMES  = ['Microfissura', 'Fissura', 'Trinca', 'Rachadura', 'Normal']
+# 0=Microfissura 1=Fissura 2=Trinca 3=Rachadura 4=Normal
+NORMAL_CLASS = 4
 VOXEL_SIZE   = 0.01   # tamanho do voxel para subsampling (metros)
 ANOMALY_PCTL = 85      # percentil de fallback para threshold GMM
+
+# ── Detecção binária (crack=1 / normal=0) ────────────────────────────────────
+# Fração média de pontos crack nas nuvens avaria (medido nos 35 PLYs)
+CRACK_RATIO      = 0.0662          # ~6.62 % dos pontos são crack
+POS_WEIGHT_DEFAULT = (1 - CRACK_RATIO) / CRACK_RATIO   # ≈ 14.1  (para BCEWithLogitsLoss)
+DATA_TRAIN_BIN   = DATA_TRAIN      # alias explícito — sempre binário
+
 # ── ENVS ────────────────────────────────────────────
 
 # ── Logging ───────────────────────────────────────────────────────────────────

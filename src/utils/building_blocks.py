@@ -12,6 +12,14 @@ import logging
 
 log = setup_logging(LOG_PATH)
 
+
+def _knn_idx(xyz: torch.Tensor, k: int) -> torch.Tensor:
+    """KNN via cKDTree: O(N log N) e O(N·k) de VRAM, vs O(N²) do torch.cdist."""
+    xyz_np = xyz.detach().cpu().numpy()
+    _, idx = cKDTree(xyz_np).query(xyz_np, k=k + 1, workers=1)
+    return torch.from_numpy(idx[:, 1:]).long().to(xyz.device)
+
+
 class LightweightGraphConv(nn.Module):
     """
     Graph Convolution leve com K-NN.
@@ -37,9 +45,7 @@ class LightweightGraphConv(nn.Module):
         k = min(self.k, N - 1)
 
         with torch.no_grad():
-            dist    = torch.cdist(xyz, xyz)
-            _, kidx = torch.topk(dist, k + 1, largest=False, dim=1)
-            kidx    = kidx[:, 1:]  # excluir self
+            kidx = _knn_idx(xyz, k)
 
         x_center  = x.unsqueeze(1).expand(-1, k, -1)          # (N, k, C)
         x_neigh   = x[kidx]                                    # (N, k, C)
@@ -72,9 +78,7 @@ class LocalSpatialAttention(nn.Module):
         k = min(self.k, N - 1)
 
         with torch.no_grad():
-            dist    = torch.cdist(xyz, xyz)
-            _, kidx = torch.topk(dist, k + 1, largest=False, dim=1)
-            kidx    = kidx[:, 1:]
+            kidx = _knn_idx(xyz, k)
 
         Q  = self.q(x)                        # (N, D)
         K_ = self.kk(x)                       # (N, D)
@@ -120,17 +124,17 @@ class MultiScaleAggregation(nn.Module):
 
     def forward(self, x: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
         N = x.size(0)
+        max_k = min(max(self.scales), N - 1)
         with torch.no_grad():
-            dist = torch.cdist(xyz, xyz)
+            kidx_all = _knn_idx(xyz, max_k)  # única chamada à tree para todas as escalas
 
         outs = []
         for k, mlp in zip(self.scales, self.mlps):
-            k_act = min(k, N - 1)
-            _, kidx = torch.topk(dist, k_act + 1, largest=False, dim=1)
-            kidx    = kidx[:, 1:]
-            x_nb    = x[kidx].mean(1)                # (N, C)
-            xyz_nb  = xyz[kidx].mean(1) - xyz         # (N, 3)
-            feat    = torch.cat([x_nb, xyz_nb], dim=1)  # (N, C+3)
+            k_act  = min(k, N - 1)
+            kidx   = kidx_all[:, :k_act]
+            x_nb   = x[kidx].mean(1)
+            xyz_nb = xyz[kidx].mean(1) - xyz
+            feat   = torch.cat([x_nb, xyz_nb], dim=1)
             outs.append(mlp(feat))
 
         return self.fusion(torch.cat(outs, dim=1))
@@ -149,9 +153,9 @@ class DensityAwareNorm(nn.Module):
     def forward(self, x: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
         k = min(self.k, len(xyz) - 1)
         with torch.no_grad():
-            dist    = torch.cdist(xyz, xyz)
-            knn, _  = torch.topk(dist, k + 1, largest=False, dim=1)
-            density = 1.0 / (knn[:, 1:].mean(1, keepdim=True) + 1e-8)
+            kidx    = _knn_idx(xyz, k)
+            knn_d   = torch.norm(xyz[kidx] - xyz.unsqueeze(1), dim=-1)  # (N, k)
+            density = 1.0 / (knn_d.mean(1, keepdim=True) + 1e-8)
             density = (density - density.min()) / (density.max() - density.min() + 1e-8)
         return self.bn(x) * self.scale(density) + self.bias(density)
 
@@ -175,16 +179,24 @@ class GatedResidualConnection(nn.Module):
 def _selective_load(model: nn.Module, sd: dict,
                     new_layer_names: list) -> tuple:
     """
-    Carregamento seletivo de pesos pré-treinados em 3 passos:
+    Carregamento seletivo de pesos pré-treinados em 4 passos:
 
     1. Correspondência exata por nome (mais confiável)
-    2. Correspondência por nome parcial — remove prefixos 'module.' / 'model.'
+    2. Correspondência por tokens '.' — remove prefixos 'module.' / 'model.'
+    2.5 Correspondência por tokens '.' e '_' — resolve nomes compostos como
+        attn_qkv → attn.qkv e attn_proj → attn.proj (PTv3 ↔ PTv3Compatible)
     3. Correspondência por shape como fallback (para layers sem nome mapeável)
 
     Layers em `new_layer_names` são SEMPRE puladas (treinadas do zero).
 
     Retorna (loaded, skipped_new, shape_mismatch) para log de aproveitamento.
     """
+    import re
+
+    def _tokens(s: str) -> set:
+        s = s.replace('module.', '').replace('model.', '')
+        return set(re.split(r'[._]', s))
+
     model_dict = model.state_dict()
     updated    = {}
     loaded     = 0
@@ -221,7 +233,7 @@ def _selective_load(model: nn.Module, sd: dict,
         if matched:
             continue
 
-        # ── Passo 2: correspondência por partes do nome ───────────────────────
+        # ── Passo 2: correspondência por partes do nome (split '.') ──────────
         name_parts = set(name.replace('module.', '').replace('model.', '').split('.'))
         for k, v in sd.items():
             if k in used_pretrained:
@@ -229,6 +241,25 @@ def _selective_load(model: nn.Module, sd: dict,
             pretrained_parts = set(k.replace('module.', '').replace('model.', '').split('.'))
             overlap = len(name_parts & pretrained_parts)
             if overlap >= 2 and v.shape == param.shape:
+                updated[name] = v
+                used_pretrained.add(k)
+                loaded += 1
+                matched = True
+                break
+
+        if matched:
+            continue
+
+        # ── Passo 2.5: correspondência fuzzy com split em '.' e '_' ──────────
+        # Resolve nomes compostos: attn_qkv → {attn, qkv}, attn_proj → {attn, proj}
+        # Threshold ≥ 3 para evitar falsos positivos com tokens genéricos ('weight').
+        name_tokens = _tokens(name)
+        for k, v in sd.items():
+            if k in used_pretrained:
+                continue
+            pretrained_tokens = _tokens(k)
+            overlap = len(name_tokens & pretrained_tokens)
+            if overlap >= 3 and v.shape == param.shape:
                 updated[name] = v
                 used_pretrained.add(k)
                 loaded += 1

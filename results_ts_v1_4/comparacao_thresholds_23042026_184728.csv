@@ -1,0 +1,2 @@
+estrategia,threshold,precision,recall,f1,iou,auroc,avg_precision
+z-score+gate+gmm+dbscan,adaptativo,0.0736,0.1472,0.0981,0.0516,0.5148,0.0736

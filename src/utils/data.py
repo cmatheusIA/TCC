@@ -94,7 +94,7 @@ class PointCloudPreprocessor:
         rgb_d   = np.asarray(pcd_down.colors,  dtype=np.float32) if rgb     is not None else None
         nrm_d   = np.asarray(pcd_down.normals, dtype=np.float32) if normals is not None else None
         if scalar is not None or labels is not None:
-            tree = cKDTree(np.asarray(pcd_down.points))
+            tree = cKDTree(xyz.astype(np.float64))  # original pre-voxel points
             _, idx = tree.query(xyz_d)
             if scalar is not None: scalar = scalar[idx]
             if labels is not None: labels = labels[idx]
@@ -312,7 +312,8 @@ PREPROCESSOR = PointCloudPreprocessor(
 )
 
 
-def load_ply_file(path: str, preprocessor: PointCloudPreprocessor = None) -> dict | None:
+def load_ply_file(path: str, preprocessor: PointCloudPreprocessor = None,
+                  improved_scalar: bool = True) -> dict | None:
     """
     Lê um arquivo PLY e retorna dict com features [N,15] e labels [N].
 
@@ -362,25 +363,36 @@ def load_ply_file(path: str, preprocessor: PointCloudPreprocessor = None) -> dic
         scalar_candidates = [c for c in props
                              if 'scalar' in c.lower() and 'label' not in c.lower()
                              and 'original' not in c.lower()]
-        scalar = v[scalar_candidates[0]].reshape(-1, 1).astype(np.float32) \
-                 if scalar_candidates else np.zeros((len(xyz), 1), dtype=np.float32)
+        scalar_col_name = scalar_candidates[0] if scalar_candidates else ''
+        scalar = v[scalar_col_name].reshape(-1, 1).astype(np.float32) \
+                 if scalar_col_name else np.zeros((len(xyz), 1), dtype=np.float32)
 
         # ── Labels por ponto (ground-truth, NÃO usados no treino) ─────────────
-        # Prioridade: scalar_labels > original_index/original > fallback por nome
-        label_candidates = [c for c in props if c.lower() == 'scalar_labels']
-        if not label_candidates:
-            label_candidates = [c for c in props
-                                if 'original_index' in c.lower()
-                                or ('original' in c.lower() and c.lower() != 'scalar_labels')]
-        if not label_candidates:
-            label_candidates = [c for c in props if 'label' in c.lower()]
-
-        if label_candidates:
-            raw_labels = v[label_candidates[0]].astype(np.int64)
+        # Prioridade:
+        #   1. 'label'         (uint8 1-5 ABNT do label_converter → remapeado para 0-4)
+        #   2. 'scalar_labels' / 'scalar_label'  (binary legado 0/1)
+        #   3. 'original*'
+        #   4. qualquer outro campo com 'label'
+        props_lower = {p.lower(): p for p in props}
+        if 'label' in props_lower:
+            raw_labels = v[props_lower['label']].astype(np.int64)
+            # ABNT 1-5 → 0-4 (CrossEntropy espera 0-indexed)
+            raw_labels = np.clip(raw_labels - 1, 0, 4)
+        elif 'scalar_labels' in props_lower:
+            raw_labels = v[props_lower['scalar_labels']].astype(np.int64)
+        elif 'scalar_label' in props_lower:
+            raw_labels = v[props_lower['scalar_label']].astype(np.int64)
         else:
-            # Fallback: todos 1 para avaria, todos 0 para n_avaria
-            raw_labels = (np.ones(len(xyz), dtype=np.int64) if has_crack
-                          else np.zeros(len(xyz), dtype=np.int64))
+            other = [p for p in props if 'original_index' in p.lower()
+                     or ('original' in p.lower())]
+            other = other or [p for p in props if 'label' in p.lower()]
+            if other:
+                raw_labels = v[other[0]].astype(np.int64)
+            else:
+                # Fallback sem label: avaria → Fissura(1), n_avaria → Normal(NORMAL_CLASS).
+                # raw_labels aqui não passa pelo remapeamento ABNT (já é 0-indexed).
+                raw_labels = (np.ones(len(xyz), dtype=np.int64) if has_crack
+                              else np.full(len(xyz), NORMAL_CLASS, dtype=np.int64))
 
         # ── Pré-processamento ─────────────────────────────────────────────────
         proc = preprocessor(
@@ -405,20 +417,28 @@ def load_ply_file(path: str, preprocessor: PointCloudPreprocessor = None) -> dic
         lum = rgb.mean(axis=1, keepdims=True)                        # (N,1) ∈ [0,1]
         sat = (rgb.max(axis=1) - rgb.min(axis=1)).reshape(-1, 1)     # (N,1) ∈ [0,1]
 
-        features = np.concatenate([
-            xyz,                      # 3  → cols 0-2
-            rgb,                      # 3  → cols 3-5
-            normals,                  # 3  → cols 6-8
-            scalar,                   # 1  → col  9
-            extra['curvature'],       # 1  → col 10
-            extra['density'],         # 1  → col 11
-            extra['variance'],        # 1  → col 12
+        base_feats = [
+            xyz,                       # 3  → cols 0-2
+            rgb,                       # 3  → cols 3-5
+            normals,                   # 3  → cols 6-8
+            scalar,                    # 1  → col  9
+            extra['curvature'],        # 1  → col 10
+            extra['density'],          # 1  → col 11
+            extra['variance'],         # 1  → col 12
             extra['surface_variation'],# 1  → col 13
-            lum,                      # 1  → col 14
-            sat,                      # 1  → col 15
-        ], axis=1).astype(np.float32) # → [N, 16]
+            lum,                       # 1  → col 14
+            sat,                       # 1  → col 15
+        ]
 
-        # Garantir 16D exatamente
+        if improved_scalar:
+            from utils.scalar_features import compute_improved_scalar_features
+            sc_extra = compute_improved_scalar_features(
+                xyz, scalar.reshape(-1), scalar_col_name, k_zscore=10, k_grad=15
+            )  # (N, 2): [z_score, gradient_mag]
+            base_feats.append(sc_extra)  # cols 16-17
+
+        features = np.concatenate(base_feats, axis=1).astype(np.float32)
+
         if features.shape[1] != INPUT_DIM:
             pad = INPUT_DIM - features.shape[1]
             features = np.concatenate(
@@ -439,7 +459,7 @@ def load_ply_file(path: str, preprocessor: PointCloudPreprocessor = None) -> dic
         return None
 
 
-def load_folder(folder: str) -> list:
+def load_folder(folder: str, improved_scalar: bool = True) -> list:
     """Carrega todos os PLY de uma pasta, descartando duplicatas pós-processamento.
 
     Dois arquivos PLY diferentes podem produzir features idênticas após
@@ -451,7 +471,7 @@ def load_folder(folder: str) -> list:
     data        = []
     seen_hashes = set()
     for p in ply_files:
-        d = load_ply_file(str(p))
+        d = load_ply_file(str(p), improved_scalar=improved_scalar)
         if d is not None:
             feat_hash = hashlib.md5(d['features'].tobytes()).hexdigest()
             if feat_hash in seen_hashes:

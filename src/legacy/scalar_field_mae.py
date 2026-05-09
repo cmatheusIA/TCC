@@ -1,26 +1,28 @@
 # ============================================================================
-# SCALAR FIELD MAE — CAMINHO B
+# SCALAR FIELD MAE — CAMINHO B (v2: sem RGB)
 # ============================================================================
 #
 # Hipótese central:
 #   Um modelo treinado em superfícies normais aprende a relação
-#   (XYZ, RGB, normais) → scalar_field esperado para aquela geometria.
-#   Em uma rachadura, a geometria e cor da superfície vizinha indicam
-#   SF alto (~200), mas o SF real é baixo (~40).
+#   (XYZ, normais) → scalar_field esperado para aquela geometria.
+#   Em uma rachadura, a geometria local indica SF alto (~200),
+#   mas o SF real é baixo (~40).
 #   Erro de reconstrução alto → anomalia.
 #
+# Mudança vs. v1 (9D com RGB):
+#   v1 usava XYZ+RGB+normais (9D) → AUROC=0.30 (invertido).
+#   Causa: RGB é proxy direto de SF (cracks escuros → SF baixo).
+#   O modelo aprendia "cor escura → SF baixo" e prediz CORRETAMENTE
+#   em cracks, gerando erro baixo onde deveria ser alto.
+#   v2 remove RGB → modelo só tem geometria para prever SF.
+#   Hipótese: geometria de crack é anômala → erro alto nas rachaduras.
+#
 # Arquitetura — LocalSFPredictor:
-#   Input  : XYZ + RGB + normais (9D) — scalar_field EXCLUÍDO do input
-#   Camada 1: MLP por ponto: 9 → 64
+#   Input  : XYZ + normais (6D) — RGB e scalar_field EXCLUÍDOS do input
+#   Camada 1: MLP por ponto: 6 → 64
 #   Camada 2: EdgeConv (kNN em XYZ): 64 → 128  [contexto de vizinhança]
 #   Camada 3: Global max-pool → MLP: 128 → 64  [contexto global da nuvem]
 #   Head   : Concat(128+64) → 64 → 1 → Sigmoid  [SF normalizado ∈ [0,1]]
-#
-# Por que excluir cols 10–15 (curvatura, densidade, variância, etc.)?
-#   Essas features geométricas já são anômalas em pontos de rachadura.
-#   Usá-las no input seria treinar o modelo para prever "SF baixo quando
-#   curvatura alta", aprendendo o sinal de rachadura diretamente em vez
-#   de a partir de evidências de superfície normal.
 #
 # Treino: apenas superfícies normais (n_avaria_*).
 # Score : |SF_pred - SF_real / 255| por ponto, suavizado por k-NN em XYZ.
@@ -62,10 +64,11 @@ EPOCHS_SF    = 100
 PATIENCE_SF  = 15
 CHUNK_EDGE   = 8_000  # pontos por chunk no EdgeConv (controla VRAM)
 
-# Colunas do input: XYZ (0-2) + RGB (3-5) + normais (6-8) = 9D
+# Colunas do input: XYZ (0-2) + normais (6-8) = 6D
+# RGB (3-5) excluído: era proxy direto de SF, causando AUROC invertido (v1)
 # Scalar_field (9) excluído — é o target
-INPUT_COLS = list(range(9))
-INPUT_DIM_SF = len(INPUT_COLS)   # 9
+INPUT_COLS   = [0, 1, 2, 6, 7, 8]
+INPUT_DIM_SF = len(INPUT_COLS)   # 6
 
 
 # ============================================================================
@@ -123,10 +126,10 @@ def _edge_conv_chunked(
 
 class LocalSFPredictor(nn.Module):
     """
-    Preditor de scalar_field a partir de XYZ + RGB + normais (9D).
+    Preditor de scalar_field a partir de XYZ + normais (6D). RGB excluído.
 
     Arquitetura:
-      1. Point MLP     : 9D → 64D  (features por ponto)
+      1. Point MLP     : 6D → 64D  (features por ponto)
       2. EdgeConv      : 64D → 128D (contexto local via kNN em XYZ)
       3. Global max-pool + MLP: 128D → 64D (contexto global da nuvem)
       4. Concat local + global = 192D
@@ -143,7 +146,7 @@ class LocalSFPredictor(nn.Module):
         super().__init__()
         self.k = k
 
-        # ── 1. MLP por ponto: 9 → 32 → 64 ────────────────────────────────────
+        # ── 1. MLP por ponto: 6 → 32 → 64 ────────────────────────────────────
         self.point_mlp = nn.Sequential(
             nn.LayerNorm(INPUT_DIM_SF),
             nn.Linear(INPUT_DIM_SF, 32),
@@ -194,7 +197,7 @@ class LocalSFPredictor(nn.Module):
         knn_idx: np.ndarray,
     ) -> torch.Tensor:
         """
-        x      : (N, 9)  — XYZ + RGB + normais
+        x      : (N, 6)  — XYZ + normais (sem RGB)
         knn_idx: (N, k)  — índices k-NN em XYZ (pré-computados, numpy)
         Returns: (N,) — SF predito normalizado ∈ [0, 1]
         """

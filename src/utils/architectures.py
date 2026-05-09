@@ -13,7 +13,7 @@
 from utils.config import *
 from utils.building_blocks import (
     LightweightGraphConv, LocalSpatialAttention, MultiScaleAggregation,
-    DensityAwareNorm, GatedResidualConnection, _selective_load
+    DensityAwareNorm, GatedResidualConnection, _selective_load, _knn_idx
 )
 
 
@@ -333,9 +333,7 @@ class SpatialMultiHeadSelfAttention(nn.Module):
 
         k = min(self.k, N - 1)
         with torch.no_grad():
-            dist    = torch.cdist(xyz, xyz)
-            _, kidx = torch.topk(dist, k + 1, largest=False, dim=1)
-            kidx    = kidx[:, 1:]
+            kidx = _knn_idx(xyz, k)
 
         attended = torch.zeros(N, H, Dh, device=x.device)
         chunk = 512
@@ -413,9 +411,7 @@ class LocalFeatureAggregation(nn.Module):
         N, C = x.shape
         k    = min(self.k, N - 1)
         with torch.no_grad():
-            dist    = torch.cdist(xyz, xyz)
-            _, kidx = torch.topk(dist, k + 1, largest=False, dim=1)
-            kidx    = kidx[:, 1:]
+            kidx = _knn_idx(xyz, k)
 
         xc  = x.unsqueeze(1).expand(-1, k, -1)
         xn  = x[kidx]
@@ -505,7 +501,11 @@ class PTv3CompatibleBlock(nn.Module):
         qkv = self.attn_qkv(h)
         qkv = qkv.reshape(N, 3, self.n_heads, self.d_head).permute(1, 2, 0, 3)
         q, k_t, v = qkv[0], qkv[1], qkv[2]
-        out = F.scaled_dot_product_attention(q, k_t, v, is_causal=False)
+        # Flash Attention requer tensores 4D (batch, heads, seq, dim).
+        # sem o unsqueeze, o PyTorch cai no backend "math" que aloca N×N explícito.
+        out = F.scaled_dot_product_attention(
+            q.unsqueeze(0), k_t.unsqueeze(0), v.unsqueeze(0), is_causal=False
+        ).squeeze(0)
         out = out.permute(1, 0, 2).reshape(N, self.d_model)
         out  = self.attn_proj(out)
         x    = residual + out
@@ -541,9 +541,12 @@ class PTv3CompatibleTeacher(nn.Module):
       proj            : LN → Linear(128→256) → GELU → Linear(256→512)  [do zero]
     """
 
-    # 'proj' era substring de 'attn_proj' — usar nomes exatos para evitar o match indevido
+    # 'proj' era substring de 'attn_proj' — usar nomes exatos para evitar o match indevido.
+    # blocks.1. e blocks.2.: enc2 do PTv3 só tem block0+block1 (→ lfa e blocks[0]);
+    # não há enc2 weights para esses blocos, então treinam do zero.
     _NEW_LAYERS = ['feature_adapter', 'cpe_linear', 'cpe_norm',
-                   'proj.0', 'proj.1', 'proj.3']   # bottleneck LN + Linear layers
+                   'proj.0', 'proj.1', 'proj.3',
+                   'blocks.1.', 'blocks.2.']
 
     def __init__(self, input_dim: int = INPUT_DIM, d_model: int = D_MODEL,
                  num_extra_blocks: int = 3, checkpoint_path: str = None):
@@ -644,7 +647,7 @@ class PTv3Teacher(nn.Module):
     Pesos: PTv3 backbone via _selective_load; feature_adapter/lfa/blocks/proj_head do zero.
     """
 
-    _NEW_LAYERS = ['feature_adapter', 'lfa', 'blocks', 'proj_head', 'stem_adapter']
+    _NEW_LAYERS = ['feature_adapter', 'lfa', 'blocks', 'proj_head', 'sf_branch']
 
     def __init__(self, input_dim: int = INPUT_DIM, checkpoint_path: str = None):
         # Verificar torchsparse — build_teacher() depende deste ImportError
@@ -659,12 +662,20 @@ class PTv3Teacher(nn.Module):
         super().__init__()
         print(f"\n🚀 PTv3Teacher (torchsparse, input={input_dim}D)")
 
-        # stem_adapter: 15D → 6D para o stem original do PTv3
-        self.stem_adapter = nn.Linear(input_dim, 6)
-
-        # feature_adapter: hook point #1 (15D → 128D)
+        # feature_adapter: processa todos os 16D (contexto geral de features).
         self.feature_adapter = nn.Sequential(
             nn.Linear(input_dim, 64), nn.LayerNorm(64), nn.ReLU(),
+            nn.Linear(64, 128),
+        )
+
+        # sf_branch: canal dedicado exclusivamente ao scalar_field (col 9).
+        # SF é o sinal primário de crack (bimodal, AUROC=0.887 sozinho).
+        # Normalização IQR por nuvem no forward garante invariância à calibração
+        # do scanner entre sessões de captura.
+        # Entrada: sf_iqr (N, 1) → saída: (N, 128)
+        self.sf_branch = nn.Sequential(
+            nn.Linear(1, 32),  nn.LayerNorm(32), nn.GELU(),
+            nn.Linear(32, 64), nn.LayerNorm(64), nn.GELU(),
             nn.Linear(64, 128),
         )
 
@@ -677,10 +688,11 @@ class PTv3Teacher(nn.Module):
         # blocks[0]: hook point #3 — projeta enc3 (256D) → 128D
         self.blocks = nn.ModuleList([nn.Linear(256, 128)])
 
-        # proj_head: enc3 → bottleneck 512D
+        # proj_head: [enc3_backbone(256D) || feature_adapter(128D) || sf_branch(128D)] → 512D
+        # 512D = 256D geometria PTv3 + 128D features gerais + 128D SF dedicado
         self.proj_head = nn.Sequential(
-            nn.LayerNorm(256),
-            nn.Linear(256, 512),
+            nn.LayerNorm(512),
+            nn.Linear(512, 512),
         )
 
         if checkpoint_path and os.path.exists(checkpoint_path):
@@ -708,6 +720,18 @@ class PTv3Teacher(nn.Module):
         coords = torch.cat([batch, coords], dim=1)
         return SparseTensor(feats=x_6d, coords=coords)
 
+    def _interp_to_points(self, query_xyz: torch.Tensor,
+                          voxel_xyz: torch.Tensor,
+                          voxel_feat: torch.Tensor) -> torch.Tensor:
+        """Nearest-neighbor: features de voxels (M, D) → pontos originais (N, D).
+
+        Necessário porque o PTv3 voxeliza internamente via strided sparse conv,
+        reduzindo M << N. O corte [:N] seria semanticamente incorreto.
+        """
+        dists  = torch.cdist(query_xyz.float(), voxel_xyz.float())  # (N, M)
+        nn_idx = dists.argmin(dim=1)                                  # (N,)
+        return voxel_feat[nn_idx]                                      # (N, D)
+
     def _load_pretrained(self, path: str):
         print(f"   📦 Carregando: {os.path.basename(path)}")
         try:
@@ -729,41 +753,79 @@ class PTv3Teacher(nn.Module):
     def unfreeze(self):
         for p in self.parameters(): p.requires_grad_(True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (N, 15) → (N, 512)"""
-        xyz = x[:, :3]
+    @staticmethod
+    def _iqr_norm_sf(sf: torch.Tensor) -> torch.Tensor:
+        """IQR normalization por nuvem: median→0, IQR→1. Invariante à calibração do scanner.
+        Operações em float32: divisão por IQR pequeno causa overflow em float16 (max=65504).
+        """
+        sf32 = sf.float()
+        med  = sf32.median()
+        iqr  = (sf32.quantile(0.75) - sf32.quantile(0.25)).clamp(min=1e-4)
+        return ((sf32 - med) / iqr).to(sf.dtype)
 
-        # hook #1: feature_adapter
-        _ = self.feature_adapter(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (N, input_dim) → (N, 512)"""
+        xyz = x[:, :3]
+        N   = x.shape[0]
+
+        # SF branch: canal dedicado com máxima prioridade.
+        # IQR norm: robusto a outliers e invariante à calibração entre nuvens.
+        sf_iqr = self._iqr_norm_sf(x[:, 9:10])   # (N, 1)
+        h_sf   = self.sf_branch(sf_iqr)            # (N, 128)
+
+        # feature_adapter: contexto geral dos 16D (inclui SF, mas compartilhado).
+        h_adapt = self.feature_adapter(x)           # (N, 128)
 
         if isinstance(self.backbone, nn.ModuleList):
-            # Backbone denso (Pointcept não disponível)
-            h = self.feature_adapter(x)
+            # Fallback denso (Pointcept não disponível): reutiliza h_adapt como input
+            h = h_adapt
             for blk in self.backbone:
                 h = blk(h, xyz)
-            enc2_feat = h
+            enc2_feat     = h
             enc3_feat_256 = torch.cat([h, h], dim=-1)   # 128→256 para simular enc3
         else:
-            # Backbone PTv3 oficial
-            x_6d   = self.stem_adapter(x)
+            # Normais (cols 6-8) no lugar do RGB: orientação de superfície é mais
+            # discriminativa para rachaduras do que cor, e evita o proxy SF→RGB.
+            x_6d   = torch.cat([x[:, :3], x[:, 6:9]], dim=1)
             sparse = self._dense_to_sparse(x_6d, xyz)
             out    = self.backbone(sparse)
-            enc2_feat     = out.get('enc2', out.get('feat', x))
-            enc3_feat_256 = out.get('enc3', enc2_feat)
-            if hasattr(enc2_feat,     'feats'): enc2_feat     = enc2_feat.feats
-            if hasattr(enc3_feat_256, 'feats'): enc3_feat_256 = enc3_feat_256.feats
-            # Garantir N consistente após voxelização
-            enc2_feat     = enc2_feat[:x.shape[0]]
-            enc3_feat_256 = enc3_feat_256[:x.shape[0]]
+
+            enc2_sparse   = out.get('enc2', out.get('feat', None))
+            enc3_sparse   = out.get('enc3', enc2_sparse)
+
+            enc2_feat     = enc2_sparse.feats if hasattr(enc2_sparse, 'feats') else enc2_sparse
+            enc3_feat_256 = enc3_sparse.feats if hasattr(enc3_sparse, 'feats') else enc3_sparse
+
+            # FIX Bug 2: interpolação nearest-neighbor de volta aos N pontos originais.
+            # O PTv3 reduz M << N via strided sparse conv; [:N] cortava features de
+            # pontos errados ou causava IndexError silencioso.
+            if enc2_feat.shape[0] != N:
+                voxel_xyz_enc2 = (enc2_sparse.coords[:, 1:].float() * VOXEL_SIZE
+                                  if hasattr(enc2_sparse, 'coords')
+                                  else enc3_sparse.coords[:, 1:].float() * VOXEL_SIZE)
+                enc2_feat = self._interp_to_points(xyz, voxel_xyz_enc2.to(xyz.device), enc2_feat)
+
+            if enc3_feat_256.shape[0] != N:
+                voxel_xyz_enc3 = (enc3_sparse.coords[:, 1:].float() * VOXEL_SIZE
+                                  if hasattr(enc3_sparse, 'coords')
+                                  else voxel_xyz_enc2)
+                enc3_feat_256 = self._interp_to_points(xyz, voxel_xyz_enc3.to(xyz.device), enc3_feat_256)
+
+            # Garantir dim 256 para proj_head (enc3 pode ser 128D se enc2=enc3 fallback)
+            if enc3_feat_256.shape[-1] == 128:
+                enc3_feat_256 = torch.cat([enc3_feat_256, enc3_feat_256], dim=-1)
+            elif enc3_feat_256.shape[-1] > 256:
+                enc3_feat_256 = enc3_feat_256[:, :256]
 
         # hook #2: lfa recebe enc2 (128D)
         enc2_feat = self.lfa(enc2_feat)
 
-        # hook #3: blocks[0] projeta enc3 → 128D
+        # hook #3: blocks[0] projeta enc3 → 128D (capturado por hooks externos)
         _ = self.blocks[0](enc3_feat_256)
 
-        # bottleneck: enc3 256D → 512D
-        return self.proj_head(enc3_feat_256)
+        # fusão: geometria PTv3 (256D) + features gerais (128D) + SF dedicado (128D) → 512D
+        enc3_fused = torch.cat([enc3_feat_256, h_adapt, h_sf], dim=-1)
+        return self.proj_head(enc3_fused)
 
 
 class PointTransformerInspiredAdvanced(nn.Module):

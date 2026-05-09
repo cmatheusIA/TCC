@@ -48,7 +48,7 @@ from utils.config import *
 from utils.data import *
 from utils.evaluation import *
 from utils.training_utils import *
-from teacher_student_v3 import (
+from legacy.teacher_student_v3 import (
     _xyz_knn, spatial_smooth_scores, _boundary_mask,
     SMOOTH_K, BOUNDARY_RADIUS, BOUNDARY_MIN_NB,
 )
@@ -164,7 +164,7 @@ class SpatialRefinementGNN(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(96, 32), nn.GELU(),
             nn.Dropout(0.3),
-            nn.Linear(32, 1), nn.Sigmoid(),
+            nn.Linear(32, 1),
         )
 
         self._init_weights()
@@ -346,7 +346,7 @@ def train_spatial_gnn(
             try:
                 with autocast():
                     score = model(x, c['knn'])         # (N,)
-                    loss  = F.binary_cross_entropy(
+                    loss  = F.binary_cross_entropy_with_logits(
                         score[msk], lbl[msk])
 
                 scaler.scale(loss).backward()
@@ -378,7 +378,7 @@ def train_spatial_gnn(
                 with autocast():
                     score = model(x, c['knn'])
                     val_losses.append(
-                        F.binary_cross_entropy(score[msk], lbl[msk]).item())
+                        F.binary_cross_entropy_with_logits(score[msk], lbl[msk]).item())
                 del x, msk, lbl
 
         if not ep_losses:
@@ -448,7 +448,7 @@ def compute_gnn_scores(
 
         x = torch.tensor(node_feat, dtype=torch.float32).to(device)
         with autocast():
-            score = model(x, knn).cpu().numpy().astype(np.float32)
+            score = torch.sigmoid(model(x, knn)).cpu().numpy().astype(np.float32)
         del x
         torch.cuda.empty_cache()
 

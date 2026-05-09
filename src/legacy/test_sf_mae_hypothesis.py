@@ -1,32 +1,30 @@
 # ============================================================================
-# DIAGNÓSTICO — Hipótese do Scalar Field MAE (Caminho B)
+# DIAGNÓSTICO — Hipótese do Scalar Field MAE (Caminho B, v2 sem RGB)
 # ============================================================================
 #
 # Hipótese a testar:
 #   Um modelo treinado em superfícies normais comete erro maior ao prever
-#   o scalar_field de pontos de rachadura do que de pontos normais.
+#   o scalar_field de pontos de rachadura do que de pontos normais,
+#   usando APENAS geometria (XYZ + normais, sem RGB).
+#
+# Contexto (v1 → v2):
+#   v1 (XYZ+RGB+normais, 9D) → AUROC=0.30 (INVERTIDO).
+#   Causa: RGB é proxy direto de SF. Modelo prediz SF baixo em cracks
+#   (escuros) corretamente → erro baixo onde deveria ser alto.
+#   v2 remove RGB para forçar predição puramente geométrica.
 #
 # Estrutura do diagnóstico (3 fases):
 #
 #   Fase 1 — Modelo NÃO treinado (aleatório):
-#     AUROC(|SF_pred_random - SF_real|, labels) ≈ 0.5
-#     Confirma que o sinal NÃO vem da arquitetura, e sim do treino.
+#     AUROC ≈ 0.5 confirma que o sinal NÃO vem da arquitetura.
 #
-#   Fase 2 — Modelo treinado em N epochs rápidos:
-#     AUROC deve ser > 0.5 e próximo do baseline SF.
-#     Se AUROC ≈ 0.5 após treino → hipótese INVÁLIDA (modelo não aprende
-#     a distinguir crack de normal pelo erro de reconstrução).
+#   Fase 2 — Ablação RGB-only (referência de comparação):
+#     Mostra o AUROC que o v1 estava atingindo via atalho RGB→SF.
+#     Esperado: AUROC_rgb > 0.5 (confirma o atalho).
 #
-#   Fase 3 — Comparação com baselines:
-#     • Scalar field bruto invertido  (AUROC ≈ 0.887 — teto de referência)
-#     • Apenas RGB → SF (modelo sem XYZ/normais)  — quanto XYZ/normais ajudam?
-#     • Modelo completo (XYZ + RGB + normais)
-#
-# Interpretação esperada se a hipótese for válida:
-#   AUROC_random ≈ 0.50
-#   AUROC_trained > 0.70
-#   AUROC_trained ≈ AUROC_sf_baseline → modelo redescobre o sinal do SF
-#                                        a partir de geometria + cor
+#   Fase 3 — Modelo v2 (XYZ + normais, sem RGB):
+#     Hipótese válida se AUROC_v2 > 0.5 (e idealmente > AUROC_rgb).
+#     Se AUROC_v2 < 0.5 → geometria também vaza sinal → hipótese morta.
 #
 # Uso: python3 src/test_sf_mae_hypothesis.py
 # ============================================================================
@@ -291,9 +289,9 @@ def main():
     res_rgb   = compute_rgb_errors(rgb_model, labeled, device)
     auroc_rgb, _, _ = evaluate_and_plot(res_rgb, f'RGB-only ({EPOCHS_FAST} epochs)')
 
-    # ── 4. FASE 3 — Modelo completo (XYZ + RGB + normais + EdgeConv) ──────────
+    # ── 4. FASE 3 — Modelo v2 (XYZ + normais, sem RGB) ───────────────────────
     print("\n" + "─"*50)
-    print(f"FASE 3 — Modelo completo ({EPOCHS_FAST} epochs rápidos)")
+    print(f"FASE 3 — Modelo v2: XYZ+normais, sem RGB ({EPOCHS_FAST} epochs)")
     print("─"*50)
 
     ckp_fast = os.path.join(OUT_DIR, 'sf_predictor_fast.pth')
@@ -309,7 +307,7 @@ def main():
     )
     res_full   = compute_recon_errors(model_full, labeled, device)
     auroc_full, _, _ = evaluate_and_plot(
-        res_full, f'SF MAE completo ({EPOCHS_FAST} epochs)')
+        res_full, f'SF MAE v2 XYZ+normais ({EPOCHS_FAST} epochs)')
 
     # ── 5. Baseline: scalar_field bruto ───────────────────────────────────────
     print("\n" + "─"*50)
@@ -331,10 +329,10 @@ def main():
 
     # ── 6. Gráfico de comparação ──────────────────────────────────────────────
     auroc_dict = {
-        'Aleatório (controle)' : auroc_random,
+        'Aleatório (controle)'          : auroc_random,
         f'RGB-only ({EPOCHS_FAST}ep)'   : auroc_rgb,
-        f'SF MAE ({EPOCHS_FAST}ep)'     : auroc_full,
-        'SF bruto (teto)'      : auroc_sf,
+        f'SF MAE v2 XYZ+norm ({EPOCHS_FAST}ep)': auroc_full,
+        'SF bruto (teto)'               : auroc_sf,
     }
     plot_auroc_comparison(auroc_dict)
 
@@ -343,36 +341,30 @@ def main():
     print("  RESUMO")
     print("="*65)
     print(f"  Aleatório          : AUROC = {auroc_random:.4f}  (controle — deve ser ≈0.5)")
-    print(f"  RGB-only           : AUROC = {auroc_rgb:.4f}  (contribuição do RGB)")
-    print(f"  SF MAE completo    : AUROC = {auroc_full:.4f}  (XYZ+RGB+normais+EdgeConv)")
+    print(f"  RGB-only           : AUROC = {auroc_rgb:.4f}  (atalho RGB→SF — referência v1)")
+    print(f"  SF MAE v2 (geom)   : AUROC = {auroc_full:.4f}  (XYZ+normais, sem RGB)")
     print(f"  SF bruto (teto)    : AUROC = {auroc_sf:.4f}")
     print()
 
-    # Decisão
-    delta_rgb  = auroc_rgb  - auroc_random
-    delta_full = auroc_full - auroc_rgb
-    delta_geo  = auroc_full - auroc_random
+    delta_vs_random = auroc_full - auroc_random
+    delta_vs_rgb    = auroc_full - auroc_rgb
 
-    print(f"  Ganho do treino (vs aleatório) : +{delta_geo:.4f}")
-    print(f"  Ganho do contexto geométrico   : +{delta_full:.4f}  "
-          f"(SF MAE vs RGB-only)")
+    print(f"  Ganho vs aleatório : {delta_vs_random:+.4f}")
+    print(f"  Ganho vs RGB-only  : {delta_vs_rgb:+.4f}  "
+          f"({'geometria MELHOR' if delta_vs_rgb > 0 else 'RGB ainda domina'})")
 
     print()
     if auroc_full > 0.75:
-        print("  ✓ Hipótese VÁLIDA — SF MAE é discriminativo. Prosseguir com Caminho B.")
+        print("  ✓ Hipótese VÁLIDA — geometria discrimina rachaduras. Prosseguir com Caminho B.")
     elif auroc_full > 0.60:
-        print("  ~ Hipótese PARCIALMENTE válida. Treino completo (100 epochs) pode ajudar.")
-        print("    Comparar com teacher_student_v1 antes de decidir.")
+        print("  ~ Hipótese PARCIAL — treino completo (100 epochs) pode ajudar.")
+        print("    Verificar se AUROC v2 > AUROC RGB-only (geometria > cor).")
+    elif auroc_full > 0.5:
+        print("  ~ Sinal fraco mas positivo. Geometria ajuda mas pouco.")
+        print("    Recomendação: testar Linear Probe no PTv3 antes de escalar.")
     else:
-        print("  ✗ Hipótese INVÁLIDA — erro de reconstrução não discrimina rachaduras.")
-        print("    Recomendação: partir para fine-tuning supervisionado.")
-
-    if delta_full > 0.05:
-        print(f"\n  ✓ Contexto geométrico (EdgeConv) agrega +{delta_full:.4f} AUROC vs RGB-only.")
-        print("    A arquitetura com local context é justificada.")
-    else:
-        print(f"\n  ~ EdgeConv agrega apenas +{delta_full:.4f} vs RGB-only.")
-        print("    Talvez só o RGB já seja suficiente para prever SF.")
+        print("  ✗ Hipótese INVÁLIDA — geometria também não discrimina.")
+        print("    Recomendação: Linear Probe no PTv3 (fine-tuning supervisionado).")
 
     print(f"\n  Resultados em: {OUT_DIR}")
     print("="*65)

@@ -1,0 +1,3 @@
+model,auroc_mean,auroc_std,f1_mean,f1_std,ap_mean,n_folds
+xgboost,0.93,0,0.595,0,N/A,35
+gmm_scalar,0.8608,0.2467,0.6213,0.3118,0.5031,32

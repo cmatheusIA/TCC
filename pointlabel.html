@@ -1,0 +1,1616 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PointLabel — Rotulador de Nuvens de Pontos</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #080b10;
+  --surface: #0e1118;
+  --surface2: #151b24;
+  --border: #1e2630;
+  --accent: #00d4ff;
+  --accent2: #007a99;
+  --text: #b8c4d0;
+  --text-dim: #48566a;
+  --text-bright: #e8f0fa;
+  --c-micro: #f6e05e;
+  --c-fissura: #f69c3e;
+  --c-trinca: #f95f5f;
+  --c-rachadura: #c060ff;
+  --c-normal-lbl: #38d68a;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+html,body { height:100%; overflow:hidden; }
+body {
+  font-family:'JetBrains Mono',monospace;
+  background:var(--bg);
+  color:var(--text);
+  display:flex;
+  flex-direction:column;
+}
+
+/* ─── HEADER ─── */
+header {
+  height:46px; flex-shrink:0;
+  background:var(--surface);
+  border-bottom:1px solid var(--border);
+  display:flex; align-items:center;
+  padding:0 16px; gap:16px;
+}
+.logo {
+  font-family:'Rajdhani',sans-serif;
+  font-weight:700; font-size:17px;
+  letter-spacing:.12em; color:var(--accent);
+}
+.logo span { color:var(--text-dim); }
+#file-info { font-size:10px; color:var(--text-dim); flex:1; }
+.hdr-btn {
+  padding:6px 14px;
+  background:transparent;
+  border:1px solid var(--accent2);
+  border-radius:3px;
+  color:var(--accent);
+  font-family:'JetBrains Mono',monospace;
+  font-size:10px; letter-spacing:.08em;
+  cursor:pointer; transition:.15s;
+}
+.hdr-btn:hover:not(:disabled) { background:var(--accent2); color:var(--bg); }
+.hdr-btn:disabled { opacity:.3; cursor:default; }
+
+/* ─── MAIN ─── */
+.main { display:flex; flex:1; overflow:hidden; }
+
+/* ─── SIDEBAR ─── */
+.sidebar {
+  width:210px; flex-shrink:0;
+  background:var(--surface);
+  border-right:1px solid var(--border);
+  display:flex; flex-direction:column;
+  overflow-y:auto;
+}
+.sec {
+  padding:10px 12px;
+  border-bottom:1px solid var(--border);
+}
+.sec-label {
+  font-size:8px; font-weight:700;
+  letter-spacing:.18em; text-transform:uppercase;
+  color:var(--text-dim); margin-bottom:8px;
+}
+
+/* Tool buttons */
+.tbtn {
+  display:flex; align-items:center; gap:7px;
+  width:100%; padding:6px 8px;
+  background:transparent;
+  border:1px solid transparent;
+  border-radius:3px;
+  color:var(--text);
+  font-family:'JetBrains Mono',monospace;
+  font-size:10px; cursor:pointer;
+  transition:.12s; margin-bottom:2px;
+}
+.tbtn:hover { background:var(--surface2); border-color:var(--border); }
+.tbtn.active { background:var(--surface2); border-color:var(--accent2); color:var(--accent); }
+.tbtn .ico { width:16px; text-align:center; font-size:13px; }
+.tbtn .key {
+  margin-left:auto; font-size:8px;
+  color:var(--text-dim);
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:2px; padding:1px 4px;
+}
+
+/* Sliders */
+.sl-row {
+  display:flex; align-items:center; gap:6px;
+  font-size:9px; margin-top:6px;
+}
+.sl-row label { color:var(--text-dim); width:58px; flex-shrink:0; }
+input[type=range] {
+  flex:1; appearance:none; height:2px;
+  background:var(--border); border-radius:1px; outline:none;
+}
+input[type=range]::-webkit-slider-thumb {
+  appearance:none; width:10px; height:10px;
+  background:var(--accent); border-radius:50%; cursor:pointer;
+}
+.sl-val { width:22px; text-align:right; color:var(--text-dim); font-size:9px; }
+
+/* Checkbox */
+.chk-row {
+  display:flex; align-items:center; gap:6px;
+  font-size:10px; color:var(--text-dim);
+  margin-top:8px; cursor:pointer;
+}
+.chk-row input { cursor:pointer; accent-color:var(--accent); }
+
+/* Label type buttons */
+.lbtn {
+  display:flex; align-items:center; gap:7px;
+  width:100%; padding:6px 8px;
+  background:transparent;
+  border:1px solid var(--border);
+  border-radius:3px;
+  color:var(--text);
+  font-family:'JetBrains Mono',monospace;
+  font-size:10px; cursor:pointer;
+  transition:.12s; margin-bottom:3px;
+  text-align:left;
+}
+.lbtn:hover { background:var(--surface2); }
+.lbtn.sel { border-width:2px; }
+.ldot { width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+.lsub { font-size:8px; color:var(--text-dim); margin-top:1px; }
+.lcnt { margin-left:auto; font-size:9px; color:var(--text-dim); }
+
+/* Action buttons */
+.abtn {
+  display:flex; align-items:center; justify-content:center; gap:6px;
+  width:100%; padding:7px;
+  background:transparent;
+  border:1px solid var(--border);
+  border-radius:3px;
+  color:var(--text);
+  font-family:'JetBrains Mono',monospace;
+  font-size:10px; cursor:pointer;
+  transition:.12s; margin-bottom:3px;
+}
+.abtn:hover { background:var(--surface2); border-color:var(--accent2); }
+.abtn.danger:hover { border-color:#c53030; color:#fc8181; background:rgba(197,48,48,.08); }
+
+/* ─── VIEWPORT ─── */
+.vp-wrap {
+  flex:1; position:relative; overflow:hidden;
+}
+#three-canvas,#lasso-canvas {
+  position:absolute; top:0; left:0;
+  width:100%; height:100%;
+}
+#lasso-canvas { pointer-events:none; }
+#lasso-canvas.armed {
+  pointer-events:all;
+  cursor:crosshair;
+}
+
+/* Drop zone */
+#drop-zone {
+  position:absolute; inset:0;
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+  gap:16px; z-index:20;
+  background:var(--bg);
+}
+.dz-icon { font-size:52px; opacity:.25; }
+.dz-title {
+  font-family:'Rajdhani',sans-serif;
+  font-size:26px; font-weight:700;
+  color:var(--text-bright); letter-spacing:.06em;
+}
+.dz-sub { font-size:11px; color:var(--text-dim); }
+.dz-btn {
+  padding:9px 22px;
+  background:transparent;
+  border:1px solid var(--accent2);
+  border-radius:3px;
+  color:var(--accent);
+  font-family:'JetBrains Mono',monospace;
+  font-size:11px; letter-spacing:.1em;
+  cursor:pointer; transition:.15s;
+}
+.dz-btn:hover { background:var(--accent2); color:var(--bg); }
+#drop-zone.drag-over { outline:2px dashed var(--accent); }
+
+/* Hint bar */
+#hint {
+  position:absolute; top:10px; left:50%;
+  transform:translateX(-50%);
+  font-size:10px; color:var(--text-dim);
+  background:rgba(8,11,16,.75);
+  padding:4px 14px; border-radius:20px;
+  pointer-events:none; display:none;
+  white-space:nowrap;
+}
+
+/* VP info */
+.vp-info {
+  position:absolute; bottom:8px; right:10px;
+  font-size:9px; color:var(--text-dim);
+  pointer-events:none; text-align:right;
+}
+
+/* Selection panel */
+#sel-panel {
+  position:absolute; bottom:20px; left:50%;
+  transform:translateX(-50%);
+  background:var(--surface);
+  border:1px solid var(--accent2);
+  border-radius:5px;
+  padding:12px 16px;
+  display:none; align-items:center; gap:10px;
+  z-index:30;
+  box-shadow:0 4px 32px rgba(0,0,0,.6);
+}
+#sel-panel.show { display:flex; }
+#sel-count { font-size:12px; color:var(--accent); white-space:nowrap; }
+.sel-btn {
+  padding:6px 12px;
+  border-radius:3px; border:1px solid;
+  font-family:'JetBrains Mono',monospace;
+  font-size:10px; cursor:pointer;
+  background:transparent; transition:.12s;
+}
+.sel-apply { border-color:var(--accent2); color:var(--accent); }
+.sel-apply:hover { background:var(--accent2); color:var(--bg); }
+.sel-cancel { border-color:var(--border); color:var(--text-dim); }
+.sel-cancel:hover { background:var(--surface2); }
+
+/* Loading overlay */
+#loading {
+  position:absolute; inset:0;
+  background:rgba(8,11,16,.88);
+  display:none; flex-direction:column;
+  align-items:center; justify-content:center;
+  gap:10px; z-index:50;
+}
+#loading.show { display:flex; }
+.ld-text { font-size:12px; color:var(--accent); }
+.ld-bar-wrap { width:180px; height:2px; background:var(--border); border-radius:1px; }
+.ld-bar { height:100%; background:var(--accent); border-radius:1px; transition:width .1s; }
+
+/* ─── RIGHT PANEL ─── */
+.rpanel {
+  width:190px; flex-shrink:0;
+  background:var(--surface);
+  border-left:1px solid var(--border);
+  display:flex; flex-direction:column;
+  overflow-y:auto;
+}
+
+/* Stats */
+.stat-item {
+  display:flex; align-items:center; gap:6px;
+  padding:4px 0; font-size:9px;
+}
+.sbar-wrap { flex:1; height:2px; background:var(--surface2); border-radius:1px; }
+.sbar { height:100%; border-radius:1px; transition:width .3s; min-width:2px; }
+.spct { width:32px; text-align:right; color:var(--text-dim); font-size:9px; }
+
+/* Toast */
+#toast {
+  position:fixed; top:54px; right:16px;
+  background:var(--surface2);
+  border:1px solid var(--border);
+  border-radius:3px; padding:8px 14px;
+  font-size:10px; color:var(--accent);
+  opacity:0; transition:opacity .25s;
+  z-index:200; pointer-events:none;
+}
+#toast.show { opacity:1; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width:3px; }
+::-webkit-scrollbar-track { background:var(--bg); }
+::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+
+code { color:var(--accent); font-size:9px; }
+.autotype-btn {
+  padding:3px 7px; font-size:8px; border-radius:2px; border:1px solid;
+  font-family:'JetBrains Mono',monospace; cursor:pointer;
+  background:transparent; transition:.12s;
+}
+.autotype-btn.sel { background:rgba(255,255,255,0.06); }
+.seg-row {
+  display:flex; align-items:center; gap:5px;
+  padding:3px 4px; border-radius:2px;
+  cursor:pointer; transition:.1s; margin-bottom:2px;
+  font-family:'JetBrains Mono',monospace;
+}
+.seg-row:hover { background:var(--surface2); }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+  <div class="logo">POINT<span>LABEL</span></div>
+  <div id="file-info">Nenhum arquivo carregado</div>
+  <button class="hdr-btn" id="exp-hdr" onclick="exportPLY()" disabled>⬇ Exportar PLY</button>
+</header>
+
+<div class="main">
+
+  <!-- LEFT SIDEBAR -->
+  <div class="sidebar">
+
+    <!-- Tools -->
+    <div class="sec">
+      <div class="sec-label">Ferramentas</div>
+      <button class="tbtn active" id="tbtn-orbit" onclick="setTool('orbit')">
+        <span class="ico">🖱</span> Orbitar <span class="key">O</span>
+      </button>
+      <button class="tbtn" id="tbtn-lasso" onclick="setTool('lasso')">
+        <span class="ico">⬡</span> Laço <span class="key">L</span>
+      </button>
+      <button class="tbtn" id="tbtn-brush" onclick="setTool('brush')">
+        <span class="ico">◎</span> Pincel <span class="key">B</span>
+      </button>
+      <button class="tbtn" id="tbtn-erase" onclick="setTool('erase')">
+        <span class="ico">✕</span> Borracha <span class="key">E</span>
+      </button>
+    </div>
+
+    <!-- Visualização -->
+    <div class="sec">
+      <div class="sec-label">Visualização</div>
+      <div class="sl-row">
+        <label>Tamanho</label>
+        <input type="range" id="pt-size" min="1" max="20" value="3">
+        <span class="sl-val" id="pt-size-v">3</span>
+      </div>
+      <div class="sl-row" id="brush-row" style="display:none">
+        <label>Pincel px</label>
+        <input type="range" id="brush-r" min="5" max="120" value="25" step="5">
+        <span class="sl-val" id="brush-r-v">25</span>
+      </div>
+      <div class="sl-row">
+        <label>Opacidade</label>
+        <input type="range" id="opacity" min="10" max="100" value="100" step="5">
+        <span class="sl-val" id="opacity-v">100</span>
+      </div>
+      <label class="chk-row">
+        <input type="checkbox" id="show-orig"> Cores originais
+      </label>
+      <label class="chk-row">
+        <input type="checkbox" id="show-scalar"> Scalar field
+      </label>
+    </div>
+
+    <!-- Tipos de avaria -->
+    <div class="sec">
+      <div class="sec-label">Tipo de Avaria — ABNT 6118</div>
+      <button class="lbtn sel" id="lb1" data-t="1" onclick="selLabel(1)" style="border-color:var(--c-micro)">
+        <div class="ldot" style="background:var(--c-micro)"></div>
+        <div><div>Microfissura</div><div class="lsub">&lt;0.05 mm</div></div>
+        <span class="lcnt" id="cnt1">0</span>
+      </button>
+      <button class="lbtn" id="lb2" data-t="2" onclick="selLabel(2)" style="border-color:var(--border)">
+        <div class="ldot" style="background:var(--c-fissura)"></div>
+        <div><div>Fissura</div><div class="lsub">0.05 – 0.5 mm</div></div>
+        <span class="lcnt" id="cnt2">0</span>
+      </button>
+      <button class="lbtn" id="lb3" data-t="3" onclick="selLabel(3)" style="border-color:var(--border)">
+        <div class="ldot" style="background:var(--c-trinca)"></div>
+        <div><div>Trinca</div><div class="lsub">0.5 – 1.5 mm</div></div>
+        <span class="lcnt" id="cnt3">0</span>
+      </button>
+      <button class="lbtn" id="lb4" data-t="4" onclick="selLabel(4)" style="border-color:var(--border)">
+        <div class="ldot" style="background:var(--c-rachadura)"></div>
+        <div><div>Rachadura</div><div class="lsub">&gt;1.5 mm</div></div>
+        <span class="lcnt" id="cnt4">0</span>
+      </button>
+      <button class="lbtn" id="lb5" data-t="5" onclick="selLabel(5)" style="border-color:var(--border)">
+        <div class="ldot" style="background:var(--c-normal-lbl)"></div>
+        <div><div>Normal</div><div class="lsub">Superfície sã</div></div>
+        <span class="lcnt" id="cnt5">0</span>
+      </button>
+      <div style="font-size:8px;color:var(--text-dim);margin-top:6px;line-height:1.6">
+        Atalho: teclas <code>1</code>–<code>5</code>
+      </div>
+    </div>
+
+    <!-- Ações -->
+    <div class="sec">
+      <div class="sec-label">Ações</div>
+      <button class="abtn" onclick="resetView()">⌂ Resetar Vista</button>
+      <button class="abtn" onclick="undoLast()">↩ Desfazer <span style="font-size:8px;color:var(--text-dim)">(Ctrl+Z)</span></button>
+      <button class="abtn danger" onclick="clearAll()">✕ Limpar Todos Labels</button>
+    </div>
+
+    <!-- Vista rápida -->
+    <div class="sec">
+      <div class="sec-label">Vista Rápida</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px">
+        <button class="abtn" onclick="setView('front')" title="Frente — câmera olha eixo Y">XZ</button>
+        <button class="abtn" onclick="setView('top')"   title="Topo — câmera olha eixo Z">XY</button>
+        <button class="abtn" onclick="setView('side')"  title="Lateral — câmera olha eixo X">YZ</button>
+        <button class="abtn" onclick="setView('iso')"   title="Perspectiva 3D">3D</button>
+      </div>
+    </div>
+
+    <!-- Auto-segmentar por Scalar Field -->
+    <div class="sec" id="autoseg-sec" style="display:none">
+      <div class="sec-label">Auto-segmentar — SF</div>
+      <div style="font-size:8px;color:var(--text-dim);margin-bottom:6px;line-height:1.6" id="sf-field-info">—</div>
+      <canvas id="sf-hist" width="186" height="52"
+        style="width:100%;border:1px solid var(--border);border-radius:2px;cursor:crosshair"></canvas>
+      <div style="font-size:7px;color:var(--text-dim);margin-top:3px;margin-bottom:4px">
+        Clique no histograma para mover threshold mais próximo
+      </div>
+      <button class="abtn" onclick="autoDetectSegments()" style="margin-bottom:5px">
+        🔍 Auto-detectar classes
+      </button>
+      <div id="seg-list" style="margin-bottom:5px"></div>
+      <div style="font-size:7px;color:var(--text-dim);margin-bottom:5px">
+        Clique em um segmento para trocar a classe
+      </div>
+      <button class="abtn" onclick="applyAutoSeg()"
+        style="border-color:var(--accent2);color:var(--accent)">
+        ⚡ Aplicar Segmentação
+      </button>
+    </div>
+
+  </div><!-- /sidebar -->
+
+  <!-- VIEWPORT -->
+  <div class="vp-wrap" id="vp">
+    <canvas id="three-canvas"></canvas>
+    <canvas id="lasso-canvas"></canvas>
+
+    <div id="drop-zone">
+      <div class="dz-icon">⬡</div>
+      <div class="dz-title">CARREGAR NUVEM DE PONTOS</div>
+      <div class="dz-sub">Arraste um arquivo .ply aqui</div>
+      <button class="dz-btn" onclick="document.getElementById('fi').click()">SELECIONAR ARQUIVO</button>
+      <input type="file" id="fi" accept=".ply" style="display:none">
+    </div>
+
+    <div id="hint"></div>
+    <div class="vp-info" id="vp-info"></div>
+
+    <!-- Selection panel -->
+    <div id="sel-panel">
+      <span id="sel-count">0 pts</span>
+      <button class="sel-btn sel-apply" onclick="applyLabel()">✓ Aplicar Rótulo</button>
+      <button class="sel-btn sel-cancel" onclick="cancelSel()">✕ Cancelar</button>
+    </div>
+
+    <div id="loading">
+      <div class="ld-text" id="ld-text">Carregando...</div>
+      <div class="ld-bar-wrap"><div class="ld-bar" id="ld-bar" style="width:0"></div></div>
+    </div>
+  </div>
+
+  <!-- RIGHT PANEL -->
+  <div class="rpanel">
+    <div class="sec">
+      <div class="sec-label">Estatísticas</div>
+      <div id="stats-box">
+        <div style="font-size:9px;color:var(--text-dim)">Carregue um arquivo.</div>
+      </div>
+    </div>
+    <div class="sec">
+      <div class="sec-label">Nuvem</div>
+      <div id="cloud-info" style="font-size:9px;color:var(--text-dim);line-height:1.9"></div>
+    </div>
+    <div class="sec" style="margin-top:auto">
+      <div class="sec-label">Exportar</div>
+      <div style="font-size:9px;color:var(--text-dim);margin-bottom:8px;line-height:1.6">
+        Gera PLY binário com campo <code>label</code> (uint8).<br>
+        0 = não rotulado, 1–5 = tipos ABNT.
+      </div>
+      <button class="abtn" id="exp-side" onclick="exportPLY()" disabled
+        style="border-color:var(--accent2);color:var(--accent)">
+        ⬇ Exportar PLY
+      </button>
+    </div>
+    <div class="sec">
+      <div class="sec-label">Atalhos</div>
+      <div style="font-size:8px;color:var(--text-dim);line-height:1.9">
+        <code>O</code> Orbitar &nbsp;<code>L</code> Laço<br>
+        <code>B</code> Pincel &nbsp;<code>E</code> Borracha<br>
+        <code>1–5</code> Tipo de avaria<br>
+        <code>Enter</code> Aplicar rótulo<br>
+        <code>Esc</code> Cancelar / orbitar<br>
+        <code>Ctrl+Z</code> Desfazer
+      </div>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<div id="toast"></div>
+
+<!-- THREE.JS -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+// ════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ════════════════════════════════════════════════════════════════
+const LCOLORS = {
+  0: null,
+  1: [1.0, 0.88, 0.08],   // microfissura - yellow
+  2: [0.96, 0.60, 0.14],  // fissura - orange
+  3: [0.97, 0.25, 0.22],  // trinca - red
+  4: [0.72, 0.22, 1.00],  // rachadura - purple
+  5: [0.16, 0.82, 0.44],  // normal - green
+};
+const LNAMES = ['Não rotulado','Microfissura','Fissura','Trinca','Rachadura','Normal'];
+const CSS_COLORS = ['var(--text-dim)','var(--c-micro)','var(--c-fissura)','var(--c-trinca)','var(--c-rachadura)','var(--c-normal-lbl)'];
+
+// ════════════════════════════════════════════════════════════════
+// STATE
+// ════════════════════════════════════════════════════════════════
+const S = {
+  loaded: false, tool: 'orbit', activeLabel: 1,
+  pts: null,      // Float32Array (x,y,z) normalized
+  origCol: null,  // Float32Array (r,g,b) 0-1
+  normals: null,  // Float32Array (nx,ny,nz)
+  scalars: null,  // Float32Array
+  labels: null,   // Int8Array
+  selMask: null,  // Uint8Array
+  n: 0,
+  undo: [],
+  lassoPath: [],
+  // originals for export
+  ox:null, oy:null, oz:null,
+  or:null, og:null, ob:null,
+  onx:null, ony:null, onz:null,
+  osc:null,
+  fname:'',
+};
+
+// ════════════════════════════════════════════════════════════════
+// THREE.JS
+// ════════════════════════════════════════════════════════════════
+const vp   = document.getElementById('vp');
+const c3   = document.getElementById('three-canvas');
+const cL   = document.getElementById('lasso-canvas');
+const lCtx = cL.getContext('2d');
+
+const renderer = new THREE.WebGLRenderer({ canvas: c3, antialias: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x080b10);
+
+const camera = new THREE.PerspectiveCamera(60, 1, 0.0001, 10000);
+camera.position.set(0, 0.3, 2.2);
+
+const controls = new THREE.OrbitControls(camera, c3);
+controls.enableDamping = true;
+controls.dampingFactor = 0.07;
+controls.screenSpacePanning = true;
+
+// Grid
+const grid = new THREE.GridHelper(4, 20, 0x121c28, 0x0e1620);
+scene.add(grid);
+
+let pCloud = null;   // THREE.Points
+let dispCol = null;  // Float32Array — display colors (updated)
+
+function resize() {
+  const w = vp.clientWidth, h = vp.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  cL.width = w; cL.height = h;
+}
+resize();
+new ResizeObserver(resize).observe(vp);
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+  if (S.loaded) {
+    const p = camera.position;
+    document.getElementById('vp-info').textContent =
+      `cam (${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}) | ${S.n.toLocaleString('pt-BR')} pts`;
+  }
+}
+animate();
+
+// ════════════════════════════════════════════════════════════════
+// PLY PARSER
+// ════════════════════════════════════════════════════════════════
+const SZ = {
+  float:4, float32:4, double:8, float64:8,
+  int:4, int32:4, uint:4, uint32:4,
+  short:2, int16:2, ushort:2, uint16:2,
+  char:1, int8:1, uchar:1, uint8:1
+};
+
+function parsePLY(buf) {
+  const bytes = new Uint8Array(buf);
+  const dec   = new TextDecoder('ascii');
+
+  // Locate end_header
+  let hdEnd = -1;
+  const target = 'end_header';
+  for (let i = 0; i < bytes.length - 12; i++) {
+    if (bytes[i] === 101 && dec.decode(bytes.slice(i, i+10)) === target) {
+      let j = i + 10;
+      while (j < bytes.length && (bytes[j] === 13 || bytes[j] === 10)) j++;
+      hdEnd = j; break;
+    }
+  }
+  if (hdEnd < 0) throw new Error('Header PLY inválido (end_header não encontrado)');
+
+  const hdr   = dec.decode(bytes.slice(0, hdEnd));
+  const lines = hdr.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+  let fmt = 'ascii', nv = 0, props = [], inVtx = false;
+  for (const ln of lines) {
+    if (ln.startsWith('format '))           { fmt = ln.split(' ')[1]; }
+    else if (ln.startsWith('element vertex')) { nv = parseInt(ln.split(' ')[2]); inVtx = true; }
+    else if (ln.startsWith('element ') && !ln.startsWith('element vertex')) { inVtx = false; }
+    else if (ln.startsWith('property ') && inVtx) {
+      const p = ln.split(/\s+/); props.push({ type: p[1].toLowerCase(), name: p[2].toLowerCase() });
+    }
+  }
+
+  const _pnames = props.map(p => p.name);
+
+  // Scalar field allowlist — explicit names only, never capture label fields
+  const _sfField = _pnames.includes('scalar_scalar_field')        ? 'scalar_scalar_field'
+    : _pnames.includes('scalar_r')                                ? 'scalar_r'
+    : _pnames.includes('scalar_field')                            ? 'scalar_field'
+    : _pnames.includes('scalar_original_cloud_index')             ? 'scalar_original_cloud_index'
+    : null;
+
+  // Existing label field — to auto-import on load
+  // priority: PointLabel format (label) > CloudCompare binary (scalar_labels / scalar_label)
+  const _lbField = _pnames.includes('label')          ? 'label'
+    : _pnames.includes('scalar_labels')               ? 'scalar_labels'
+    : _pnames.includes('scalar_label')                ? 'scalar_label'
+    : null;
+  const _lbIsBinary = _lbField === 'scalar_labels' || _lbField === 'scalar_label';
+
+  const x_=new Float32Array(nv), y_=new Float32Array(nv), z_=new Float32Array(nv);
+  const r_=new Float32Array(nv), g_=new Float32Array(nv), b_=new Float32Array(nv);
+  const nx_=new Float32Array(nv), ny_=new Float32Array(nv), nz_=new Float32Array(nv);
+  const sc_=new Float32Array(nv);
+  const lb_=new Uint8Array(nv);
+
+  function store(name, val, i) {
+    if      (name==='x')   x_[i]=val;
+    else if (name==='y')   y_[i]=val;
+    else if (name==='z')   z_[i]=val;
+    else if (name==='red'  || name==='r') r_[i]=val>1.5?val/255:val;
+    else if (name==='green'|| name==='g') g_[i]=val>1.5?val/255:val;
+    else if (name==='blue' || name==='b') b_[i]=val>1.5?val/255:val;
+    else if (name==='nx')  nx_[i]=val;
+    else if (name==='ny')  ny_[i]=val;
+    else if (name==='nz')  nz_[i]=val;
+    else if (_sfField && name === _sfField) sc_[i]=val;
+    else if (_lbField && name === _lbField) lb_[i]=Math.round(val);
+  }
+
+  if (fmt === 'ascii') {
+    const txt  = dec.decode(bytes.slice(hdEnd));
+    const rows = txt.trim().split(/\r?\n/);
+    for (let i = 0; i < Math.min(nv, rows.length); i++) {
+      const vals = rows[i].trim().split(/\s+/);
+      for (let pi = 0; pi < props.length; pi++) store(props[pi].name, parseFloat(vals[pi]||0), i);
+    }
+  } else {
+    const le   = fmt !== 'binary_big_endian';
+    const view = new DataView(buf, hdEnd);
+    // Compute stride
+    let stride = 0;
+    for (const p of props) stride += SZ[p.type] || 1;
+
+    let off = 0;
+    for (let i = 0; i < nv; i++) {
+      let po = 0;
+      for (const p of props) {
+        const sz = SZ[p.type] || 1;
+        let val = 0;
+        try {
+          if      (p.type==='float'||p.type==='float32') val = view.getFloat32(off+po, le);
+          else if (p.type==='double'||p.type==='float64') val = view.getFloat64(off+po, le);
+          else if (p.type==='uchar'||p.type==='uint8')   val = view.getUint8(off+po);
+          else if (p.type==='char'||p.type==='int8')     val = view.getInt8(off+po);
+          else if (p.type==='ushort'||p.type==='uint16') val = view.getUint16(off+po, le);
+          else if (p.type==='short'||p.type==='int16')   val = view.getInt16(off+po, le);
+          else if (p.type==='uint'||p.type==='uint32')   val = view.getUint32(off+po, le);
+          else if (p.type==='int'||p.type==='int32')     val = view.getInt32(off+po, le);
+        } catch(e) { /* out of bounds, skip */ }
+        store(p.name, val, i);
+        po += sz;
+      }
+      off += stride;
+    }
+  }
+
+  return { nv, props, x:x_, y:y_, z:z_, r:r_, g:g_, b:b_, nx:nx_, ny:ny_, nz:nz_, sc:sc_,
+           sfField:_sfField, lb:lb_, lbField:_lbField, lbIsBinary:_lbIsBinary };
+}
+
+// ════════════════════════════════════════════════════════════════
+// BUILD POINT CLOUD
+// ════════════════════════════════════════════════════════════════
+function buildCloud(parsed, fname) {
+  const n = parsed.nv;
+  S.n = n; S.fname = fname;
+  S.labels          = new Int8Array(n);
+  S.selMask         = new Uint8Array(n);
+  S.undo            = [];
+  S.lbField         = parsed.lbField   || null;
+  S.lbIsBinary      = parsed.lbIsBinary || false;
+  S.rawBinaryLabels = null;
+
+  // Auto-import existing labels when PLY already has annotations
+  if (parsed.lbField && parsed.lb) {
+    const lb = parsed.lb;
+    let cntCrack = 0, cntNorm = 0;
+    if (parsed.lbIsBinary) {
+      // scalar_labels / scalar_label (0/1): armazena máscara binária original
+      // para o auto-seg usar SF+labels combinados; label visual = Microfissura provisório
+      S.rawBinaryLabels = new Uint8Array(n);
+      for (let i=0;i<n;i++) {
+        S.rawBinaryLabels[i] = lb[i]>0 ? 1 : 0;
+        if (lb[i]>0) { S.labels[i]=1; cntCrack++; }
+        else         { S.labels[i]=5; cntNorm++;  }
+      }
+      setTimeout(()=>toast(
+        `↩ "${parsed.lbField}": ${cntCrack.toLocaleString('pt-BR')} crack + ${cntNorm.toLocaleString('pt-BR')} Normal — use Auto-detectar para classificar severidade`
+      ), 450);
+    } else {
+      // PointLabel label field (0–5): import direto
+      for (let i=0;i<n;i++) {
+        if (lb[i]>=0 && lb[i]<=5) { S.labels[i]=lb[i]; if(lb[i]>0) cntCrack++; }
+      }
+      setTimeout(()=>toast(
+        `↩ Importado "${parsed.lbField}": ${cntCrack.toLocaleString('pt-BR')} pts rotulados`
+      ), 450);
+    }
+  }
+
+  // Bounding box → center & normalize
+  let mnX=Infinity,mnY=Infinity,mnZ=Infinity;
+  let mxX=-Infinity,mxY=-Infinity,mxZ=-Infinity;
+  for (let i=0;i<n;i++){
+    if(parsed.x[i]<mnX)mnX=parsed.x[i]; if(parsed.x[i]>mxX)mxX=parsed.x[i];
+    if(parsed.y[i]<mnY)mnY=parsed.y[i]; if(parsed.y[i]>mxY)mxY=parsed.y[i];
+    if(parsed.z[i]<mnZ)mnZ=parsed.z[i]; if(parsed.z[i]>mxZ)mxZ=parsed.z[i];
+  }
+  const cx=(mnX+mxX)/2, cy=(mnY+mxY)/2, cz=(mnZ+mxZ)/2;
+  const sc=1/Math.max(mxX-mnX||1e-6, mxY-mnY||1e-6, mxZ-mnZ||1e-6);
+
+  const pos     = new Float32Array(n*3);
+  const origCol = new Float32Array(n*3);
+  for (let i=0;i<n;i++){
+    pos[i*3]   = (parsed.x[i]-cx)*sc;
+    pos[i*3+1] = (parsed.y[i]-cy)*sc;
+    pos[i*3+2] = (parsed.z[i]-cz)*sc;
+    origCol[i*3]   = parsed.r[i];
+    origCol[i*3+1] = parsed.g[i];
+    origCol[i*3+2] = parsed.b[i];
+  }
+
+  S.pts = pos; S.origCol = origCol;
+  S.normals = new Float32Array(n*3);
+  S.scalars = parsed.sc;
+  S.sfField = parsed.sfField || null;
+  for (let i=0;i<n;i++){
+    S.normals[i*3]=parsed.nx[i]; S.normals[i*3+1]=parsed.ny[i]; S.normals[i*3+2]=parsed.nz[i];
+  }
+
+  // Keep originals for export
+  S.ox=parsed.x; S.oy=parsed.y; S.oz=parsed.z;
+  S.or=new Uint8Array(n); S.og=new Uint8Array(n); S.ob=new Uint8Array(n);
+  for(let i=0;i<n;i++){
+    S.or[i]=Math.round(parsed.r[i]*255);
+    S.og[i]=Math.round(parsed.g[i]*255);
+    S.ob[i]=Math.round(parsed.b[i]*255);
+  }
+  S.onx=parsed.nx; S.ony=parsed.ny; S.onz=parsed.nz; S.osc=parsed.sc;
+
+  // Build THREE
+  if (pCloud) { scene.remove(pCloud); pCloud.geometry.dispose(); pCloud.material.dispose(); }
+
+  dispCol = origCol.slice();
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color',    new THREE.BufferAttribute(dispCol, 3));
+  const mat = new THREE.PointsMaterial({ size:0.003, vertexColors:true, sizeAttenuation:true });
+  pCloud = new THREE.Points(geo, mat);
+  scene.add(pCloud);
+
+  // Camera
+  camera.position.set(0, 0.2, 2.2);
+  controls.target.set(0, 0, 0);
+  controls.update();
+
+  S.loaded = true;
+  document.getElementById('drop-zone').style.display = 'none';
+  document.getElementById('hint').style.display = 'block';
+  document.getElementById('file-info').textContent =
+    fname + ' — ' + n.toLocaleString('pt-BR') + ' pontos';
+  document.getElementById('exp-hdr').disabled  = false;
+  document.getElementById('exp-side').disabled = false;
+  document.getElementById('cloud-info').innerHTML =
+    `Total: ${n.toLocaleString('pt-BR')} pts<br>` +
+    `ΔX: ${(mxX-mnX).toFixed(4)} m<br>` +
+    `ΔY: ${(mxY-mnY).toFixed(4)} m<br>` +
+    `ΔZ: ${(mxZ-mnZ).toFixed(4)} m`;
+
+  refreshColors(); updateStats(); updatePtSize(); updateHint(); initAutoSeg();
+}
+
+// ════════════════════════════════════════════════════════════════
+// COLORS
+// ════════════════════════════════════════════════════════════════
+function refreshColors() {
+  if (!S.loaded) return;
+  const showOrig   = document.getElementById('show-orig').checked;
+  const showScalar = document.getElementById('show-scalar').checked;
+  const n = S.n;
+
+  // Pre-compute SF normalization for scalar view
+  const sfRange = (AutoSeg.sfMax - AutoSeg.sfMin) || 1;
+
+  for (let i=0;i<n;i++) {
+    if (S.selMask[i]) {
+      // Seleção ativa → ciano
+      dispCol[i*3]=0; dispCol[i*3+1]=0.85; dispCol[i*3+2]=1.0;
+    } else if (showScalar && S.scalars) {
+      // Scalar field heatmap — prioridade máxima
+      const sv = (S.scalars[i] - AutoSeg.sfMin) / sfRange;
+      dispCol[i*3]   = Math.min(1, sv*2);
+      dispCol[i*3+1] = sv < 0.5 ? sv*2 : (1-sv)*2;
+      dispCol[i*3+2] = Math.max(0, 1-sv*2);
+    } else if (S.labels[i] !== 0 && !showOrig) {
+      // Label color — visível quando "Cores originais" está desmarcado
+      const c = LCOLORS[S.labels[i]];
+      dispCol[i*3]=c[0]; dispCol[i*3+1]=c[1]; dispCol[i*3+2]=c[2];
+    } else {
+      // RGB original — pontos sem label OU quando "Cores originais" está marcado
+      dispCol[i*3]=S.origCol[i*3]; dispCol[i*3+1]=S.origCol[i*3+1]; dispCol[i*3+2]=S.origCol[i*3+2];
+    }
+  }
+  pCloud.geometry.attributes.color.needsUpdate = true;
+}
+
+// ════════════════════════════════════════════════════════════════
+// TOOLS
+// ════════════════════════════════════════════════════════════════
+function setTool(t) {
+  S.tool = t;
+  S.lassoPath = [];
+  lassoDrawing = false;
+  clearLC();
+  document.querySelectorAll('.tbtn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('tbtn-'+t).classList.add('active');
+  controls.enabled = (t==='orbit');
+  if (t==='orbit') {
+    cL.classList.remove('armed');
+  } else {
+    cL.classList.add('armed');
+  }
+  document.getElementById('brush-row').style.display =
+    (t==='brush'||t==='erase') ? 'flex' : 'none';
+  updateHint();
+}
+
+function selLabel(n) {
+  S.activeLabel = n;
+  document.querySelectorAll('.lbtn').forEach(b=>{
+    b.classList.remove('sel');
+    b.style.borderColor = 'var(--border)';
+    b.style.borderWidth = '1px';
+  });
+  const btn = document.getElementById('lb'+n);
+  const colors_map = {1:'var(--c-micro)',2:'var(--c-fissura)',3:'var(--c-trinca)',4:'var(--c-rachadura)',5:'var(--c-normal-lbl)'};
+  btn.classList.add('sel');
+  btn.style.borderColor = colors_map[n];
+  btn.style.borderWidth = '2px';
+  updateHint();
+}
+
+// ════════════════════════════════════════════════════════════════
+// LASSO
+// ════════════════════════════════════════════════════════════════
+let lassoDrawing = false;
+
+cL.addEventListener('mousedown', e => {
+  if (!S.loaded) return;
+  if (S.tool === 'lasso') {
+    S.lassoPath = [{ x: e.offsetX, y: e.offsetY }];
+    lassoDrawing = true;
+  } else if (S.tool === 'brush' || S.tool === 'erase') {
+    S._brushUndo = false;
+    doBrush(e.offsetX, e.offsetY);
+  }
+});
+
+cL.addEventListener('mousemove', e => {
+  if (!S.loaded) return;
+  if (S.tool === 'lasso' && lassoDrawing) {
+    S.lassoPath.push({ x: e.offsetX, y: e.offsetY });
+    drawLasso();
+  } else if ((S.tool==='brush'||S.tool==='erase') && e.buttons===1) {
+    doBrush(e.offsetX, e.offsetY);
+    drawBrushCursor(e.offsetX, e.offsetY);
+  } else if (S.tool==='brush'||S.tool==='erase') {
+    drawBrushCursor(e.offsetX, e.offsetY);
+  }
+});
+
+cL.addEventListener('mouseup', e => {
+  if (!S.loaded) return;
+  if (S.tool === 'lasso' && lassoDrawing) {
+    lassoDrawing = false;
+    if (S.lassoPath.length > 4) finishLasso();
+    else { clearLC(); S.lassoPath = []; }
+  }
+  S._brushUndo = false;
+});
+
+cL.addEventListener('dblclick', e => {
+  if (S.tool==='lasso' && S.lassoPath.length>4) { lassoDrawing=false; finishLasso(); }
+});
+
+cL.addEventListener('mouseleave', () => {
+  clearLC();
+  if (!lassoDrawing) S.lassoPath = [];
+});
+
+function drawLasso() {
+  clearLC();
+  const pts = S.lassoPath;
+  if (pts.length < 2) return;
+  lCtx.beginPath();
+  lCtx.moveTo(pts[0].x, pts[0].y);
+  for (let i=1;i<pts.length;i++) lCtx.lineTo(pts[i].x, pts[i].y);
+  lCtx.closePath();
+  lCtx.fillStyle   = 'rgba(0,212,255,0.07)';
+  lCtx.fill();
+  lCtx.beginPath();
+  lCtx.moveTo(pts[0].x, pts[0].y);
+  for (let i=1;i<pts.length;i++) lCtx.lineTo(pts[i].x, pts[i].y);
+  lCtx.strokeStyle = 'rgba(0,212,255,0.65)';
+  lCtx.lineWidth   = 1.5;
+  lCtx.setLineDash([5,4]);
+  lCtx.stroke();
+  lCtx.setLineDash([]);
+  lCtx.beginPath();
+  lCtx.arc(pts[0].x, pts[0].y, 4, 0, Math.PI*2);
+  lCtx.fillStyle = '#00d4ff'; lCtx.fill();
+}
+
+function finishLasso() {
+  const poly = S.lassoPath;
+  const w = cL.width, h = cL.height;
+  const pos = S.pts, n = S.n;
+  const v = new THREE.Vector3();
+  let cnt = 0;
+  for (let i=0;i<n;i++) {
+    v.set(pos[i*3], pos[i*3+1], pos[i*3+2]);
+    v.project(camera);
+    if (v.z > 1) continue;
+    const sx = (v.x*0.5+0.5)*w;
+    const sy = (-v.y*0.5+0.5)*h;
+    if (pip(sx, sy, poly)) { S.selMask[i]=1; cnt++; }
+  }
+  clearLC(); S.lassoPath = [];
+  if (cnt > 0) { refreshColors(); showSelPanel(cnt); }
+  else toast('Nenhum ponto selecionado');
+}
+
+// Point-in-polygon ray casting
+function pip(x, y, poly) {
+  let inside = false;
+  for (let i=0,j=poly.length-1; i<poly.length; j=i++) {
+    const xi=poly[i].x, yi=poly[i].y, xj=poly[j].x, yj=poly[j].y;
+    if (((yi>y)!==(yj>y)) && (x<(xj-xi)*(y-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
+
+function clearLC() { lCtx.clearRect(0,0,cL.width,cL.height); }
+
+// ════════════════════════════════════════════════════════════════
+// BRUSH
+// ════════════════════════════════════════════════════════════════
+let _brushThrottle = 0;
+
+function doBrush(mx, my) {
+  if (!S.loaded) return;
+  const now = performance.now();
+  if (now - _brushThrottle < 30) return; // throttle 30ms
+  _brushThrottle = now;
+
+  const r = parseInt(document.getElementById('brush-r').value);
+  const r2 = r*r;
+  const w = cL.width, h = cL.height;
+  const pos = S.pts, n = S.n;
+  const v = new THREE.Vector3();
+
+  if (!S._brushUndo) {
+    pushUndo();
+    S._brushUndo = true;
+  }
+
+  for (let i=0;i<n;i++) {
+    v.set(pos[i*3], pos[i*3+1], pos[i*3+2]);
+    v.project(camera);
+    if (v.z > 1) continue;
+    const sx=(v.x*0.5+0.5)*w, sy=(-v.y*0.5+0.5)*h;
+    const dx=sx-mx, dy=sy-my;
+    if (dx*dx+dy*dy <= r2) {
+      S.labels[i] = S.tool==='erase' ? 0 : S.activeLabel;
+    }
+  }
+  refreshColors(); updateStats();
+}
+
+function drawBrushCursor(x, y) {
+  clearLC();
+  const r = parseInt(document.getElementById('brush-r').value);
+  lCtx.beginPath();
+  lCtx.arc(x, y, r, 0, Math.PI*2);
+  lCtx.strokeStyle = S.tool==='erase' ? 'rgba(249,95,95,0.7)' : 'rgba(0,212,255,0.6)';
+  lCtx.lineWidth = 1.5;
+  lCtx.stroke();
+  lCtx.fillStyle = S.tool==='erase' ? 'rgba(249,95,95,0.05)' : 'rgba(0,212,255,0.05)';
+  lCtx.fill();
+}
+
+// ════════════════════════════════════════════════════════════════
+// SELECTION PANEL
+// ════════════════════════════════════════════════════════════════
+function showSelPanel(cnt) {
+  document.getElementById('sel-count').textContent =
+    cnt.toLocaleString('pt-BR') + ' pts selecionados — ' + LNAMES[S.activeLabel];
+  document.getElementById('sel-panel').classList.add('show');
+}
+
+function applyLabel() {
+  pushUndo();
+  let cnt = 0;
+  for (let i=0;i<S.n;i++) {
+    if (S.selMask[i]) { S.labels[i]=S.activeLabel; S.selMask[i]=0; cnt++; }
+  }
+  document.getElementById('sel-panel').classList.remove('show');
+  refreshColors(); updateStats();
+  toast('✓ ' + cnt.toLocaleString('pt-BR') + ' pts → ' + LNAMES[S.activeLabel]);
+}
+
+function cancelSel() {
+  for (let i=0;i<S.n;i++) S.selMask[i]=0;
+  document.getElementById('sel-panel').classList.remove('show');
+  refreshColors();
+}
+
+// ════════════════════════════════════════════════════════════════
+// UNDO
+// ════════════════════════════════════════════════════════════════
+function pushUndo() {
+  S.undo.push(S.labels.slice());
+  if (S.undo.length > 25) S.undo.shift();
+}
+
+function undoLast() {
+  if (!S.undo.length) { toast('Nada para desfazer'); return; }
+  S.labels = S.undo.pop();
+  for (let i=0;i<S.n;i++) S.selMask[i]=0;
+  document.getElementById('sel-panel').classList.remove('show');
+  refreshColors(); updateStats();
+  toast('↩ Desfeito');
+}
+
+function clearAll() {
+  if (!S.loaded) return;
+  pushUndo();
+  S.labels = new Int8Array(S.n);
+  for (let i=0;i<S.n;i++) S.selMask[i]=0;
+  document.getElementById('sel-panel').classList.remove('show');
+  refreshColors(); updateStats();
+  toast('Labels removidas');
+}
+
+// ════════════════════════════════════════════════════════════════
+// STATS
+// ════════════════════════════════════════════════════════════════
+function updateStats() {
+  if (!S.loaded) return;
+  const cnt = [0,0,0,0,0,0];
+  for (let i=0;i<S.n;i++) cnt[S.labels[i]]++;
+  for (let t=1;t<=5;t++) document.getElementById('cnt'+t).textContent = cnt[t].toLocaleString('pt-BR');
+  const tot = S.n;
+  const labeled = tot - cnt[0];
+  let html = `<div style="font-size:9px;color:var(--text-dim);margin-bottom:8px">
+    Rotulados: <span style="color:var(--text)">${labeled.toLocaleString('pt-BR')} / ${tot.toLocaleString('pt-BR')}
+    (${((labeled/tot)*100).toFixed(1)}%)</span></div>`;
+  for (let t=1;t<=5;t++) {
+    const pct = (cnt[t]/tot*100).toFixed(1);
+    html += `<div class="stat-item">
+      <div class="ldot" style="background:${CSS_COLORS[t]}"></div>
+      <div style="font-size:9px;color:var(--text-dim);flex:1;overflow:hidden;
+           text-overflow:ellipsis;white-space:nowrap">${LNAMES[t]}</div>
+      <div class="sbar-wrap"><div class="sbar" style="width:${pct}%;background:${CSS_COLORS[t]}"></div></div>
+      <div class="spct">${pct}%</div>
+    </div>`;
+  }
+  if (cnt[0] > 0) {
+    const pct = (cnt[0]/tot*100).toFixed(1);
+    html += `<div class="stat-item">
+      <div class="ldot" style="background:${CSS_COLORS[0]}"></div>
+      <div style="font-size:9px;color:var(--text-dim);flex:1">Não rotulado</div>
+      <div class="sbar-wrap"><div class="sbar" style="width:${pct}%;background:${CSS_COLORS[0]}"></div></div>
+      <div class="spct">${pct}%</div>
+    </div>`;
+  }
+  document.getElementById('stats-box').innerHTML = html;
+}
+
+// ════════════════════════════════════════════════════════════════
+// POINT SIZE / OPACITY
+// ════════════════════════════════════════════════════════════════
+function updatePtSize() {
+  if (!pCloud) return;
+  const v = parseInt(document.getElementById('pt-size').value);
+  pCloud.material.size = v * 0.001;
+  document.getElementById('pt-size-v').textContent = v;
+}
+document.getElementById('pt-size').addEventListener('input', updatePtSize);
+document.getElementById('brush-r').addEventListener('input', () => {
+  document.getElementById('brush-r-v').textContent = document.getElementById('brush-r').value;
+});
+document.getElementById('opacity').addEventListener('input', () => {
+  const v = parseInt(document.getElementById('opacity').value);
+  document.getElementById('opacity-v').textContent = v;
+  if (pCloud) { pCloud.material.opacity = v/100; pCloud.material.transparent = v<100; }
+});
+document.getElementById('show-orig').addEventListener('change', refreshColors);
+document.getElementById('show-scalar').addEventListener('change', () => {
+  if (document.getElementById('show-scalar').checked)
+    document.getElementById('show-orig').checked = false;
+  refreshColors();
+});
+
+// ════════════════════════════════════════════════════════════════
+// HINT
+// ════════════════════════════════════════════════════════════════
+function updateHint() {
+  const map = {
+    orbit:  'Arrastar → orbitar  |  Scroll → zoom  |  Shift+arrastar → mover',
+    lasso:  `Arrastar → desenhar laço  |  Soltar → selecionar  |  Label: ${LNAMES[S.activeLabel]}`,
+    brush:  `Clique/arrastar → pintar como ${LNAMES[S.activeLabel]}  |  Ajuste raio na sidebar`,
+    erase:  'Clique/arrastar → apagar labels  |  [O] voltar ao modo orbitar',
+  };
+  const el = document.getElementById('hint');
+  el.textContent = map[S.tool] || '';
+  el.style.display = S.loaded ? 'block' : 'none';
+}
+
+function resetView() {
+  camera.position.set(0, 0.2, 2.2);
+  camera.up.set(0,1,0);
+  controls.target.set(0,0,0);
+  controls.update();
+}
+
+function setView(which) {
+  const D=2.4;
+  camera.up.set(0,1,0); // default
+  if      (which==='front') { camera.position.set(0,D,0.01);  camera.up.set(0,0,1); }
+  else if (which==='top')   { camera.position.set(0.01,0.01,D); }
+  else if (which==='side')  { camera.position.set(D,0.01,0.01); }
+  else                      { camera.position.set(1.4,1.2,1.6); }
+  controls.target.set(0,0,0);
+  controls.update();
+}
+
+// ════════════════════════════════════════════════════════════════
+// EXPORT PLY
+// ════════════════════════════════════════════════════════════════
+function exportPLY() {
+  if (!S.loaded) return;
+  toast('Gerando arquivo...');
+  setTimeout(() => {
+    try {
+      const n = S.n;
+      // PLY header
+      const hdr = [
+        'ply',
+        'format binary_little_endian 1.0',
+        'comment Gerado por PointLabel — Rotulador de Nuvens de Pontos',
+        `element vertex ${n}`,
+        'property float x',
+        'property float y',
+        'property float z',
+        'property uchar red',
+        'property uchar green',
+        'property uchar blue',
+        'property float nx',
+        'property float ny',
+        'property float nz',
+        'property float scalar_field',
+        'property uchar label',
+        'end_header',
+        ''
+      ].join('\n');
+
+      const hdrBytes = new TextEncoder().encode(hdr);
+
+      // Per vertex: 3×float + 3×uchar + 3×float + 1×float + 1×uchar = 12+3+12+4+1 = 32 bytes
+      const VSTRIDE = 32;
+      const dataBuf = new ArrayBuffer(n * VSTRIDE);
+      const view    = new DataView(dataBuf);
+
+      for (let i=0;i<n;i++) {
+        const off = i * VSTRIDE;
+        view.setFloat32(off,    S.ox[i], true);
+        view.setFloat32(off+4,  S.oy[i], true);
+        view.setFloat32(off+8,  S.oz[i], true);
+        view.setUint8(off+12,   S.or[i]);
+        view.setUint8(off+13,   S.og[i]);
+        view.setUint8(off+14,   S.ob[i]);
+        view.setFloat32(off+15, S.onx[i], true);
+        view.setFloat32(off+19, S.ony[i], true);
+        view.setFloat32(off+23, S.onz[i], true);
+        view.setFloat32(off+27, S.osc[i], true);
+        view.setUint8(off+31,   Math.max(0, S.labels[i]));
+      }
+
+      const blob = new Blob([hdrBytes, dataBuf], { type:'application/octet-stream' });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href     = url;
+      a.download = S.fname.replace('.ply','') + '_labeled.ply';
+      a.click();
+      URL.revokeObjectURL(url);
+
+      const lc = Array.from(S.labels).filter(l=>l>0).length;
+      toast(`✓ Exportado: ${lc.toLocaleString('pt-BR')} pts rotulados`);
+    } catch(e) {
+      toast('Erro ao exportar: ' + e.message, true);
+      console.error(e);
+    }
+  }, 40);
+}
+
+// ════════════════════════════════════════════════════════════════
+// FILE LOADING
+// ════════════════════════════════════════════════════════════════
+function loadFile(file) {
+  if (!file.name.toLowerCase().endsWith('.ply')) { toast('Selecione um arquivo .ply', true); return; }
+  showLoad('Lendo arquivo…');
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      setLoadPct(30, 'Parseando PLY…');
+      const parsed = parsePLY(e.target.result);
+      setLoadPct(70, 'Construindo geometria…');
+      buildCloud(parsed, file.name);
+      setLoadPct(100, 'Pronto!');
+      setTimeout(hideLoad, 350);
+    } catch(err) {
+      hideLoad();
+      toast('Erro: ' + err.message, true);
+      console.error(err);
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+const dz = document.getElementById('drop-zone');
+dz.addEventListener('dragover', e=>{ e.preventDefault(); dz.classList.add('drag-over'); });
+dz.addEventListener('dragleave', ()=>dz.classList.remove('drag-over'));
+dz.addEventListener('drop', e=>{
+  e.preventDefault(); dz.classList.remove('drag-over');
+  const f = e.dataTransfer.files[0];
+  if (f) loadFile(f);
+});
+document.getElementById('fi').addEventListener('change', e=>{
+  if (e.target.files[0]) loadFile(e.target.files[0]);
+});
+
+// Allow drop anywhere when loaded
+document.addEventListener('dragover', e=>e.preventDefault());
+document.addEventListener('drop', e=>{
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.toLowerCase().endsWith('.ply')) loadFile(f);
+});
+
+// ════════════════════════════════════════════════════════════════
+// LOADING UI
+// ════════════════════════════════════════════════════════════════
+function showLoad(t) {
+  document.getElementById('loading').classList.add('show');
+  document.getElementById('ld-text').textContent = t;
+  document.getElementById('ld-bar').style.width = '0';
+}
+function setLoadPct(p, t) {
+  document.getElementById('ld-bar').style.width = p + '%';
+  if (t) document.getElementById('ld-text').textContent = t;
+}
+function hideLoad() { document.getElementById('loading').classList.remove('show'); }
+
+// ════════════════════════════════════════════════════════════════
+// TOAST
+// ════════════════════════════════════════════════════════════════
+let _tT;
+function toast(msg, isErr=false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.color = isErr ? '#f95f5f' : 'var(--accent)';
+  el.classList.add('show');
+  clearTimeout(_tT);
+  _tT = setTimeout(()=>el.classList.remove('show'), 2800);
+}
+
+// ════════════════════════════════════════════════════════════════
+// KEYBOARD
+// ════════════════════════════════════════════════════════════════
+document.addEventListener('keydown', e => {
+  if (!S.loaded) return;
+  if (e.ctrlKey && e.key==='z') { e.preventDefault(); undoLast(); return; }
+  if (e.key==='Escape') { cancelSel(); setTool('orbit'); return; }
+  if (e.key==='Enter')  { if (document.getElementById('sel-panel').classList.contains('show')) applyLabel(); return; }
+  if (e.key==='o'||e.key==='O') { setTool('orbit'); return; }
+  if (e.key==='l'||e.key==='L') { setTool('lasso'); return; }
+  if (e.key==='b'||e.key==='B') { setTool('brush'); return; }
+  if (e.key==='e'||e.key==='E') { setTool('erase'); return; }
+  if (e.key>='1'&&e.key<='5')   { selLabel(parseInt(e.key)); return; }
+});
+
+// ════════════════════════════════════════════════════════════════
+// AUTO-SEGMENTATION BY SCALAR FIELD
+// ════════════════════════════════════════════════════════════════
+const AutoSeg = {
+  sfMin:0, sfMax:255,
+  histNorm:null, histRaw:null,
+  BINS:64,
+  segments:[]   // [{upTo: sfValue, label: 1-5}, ..., {upTo:Infinity, label:5}]
+};
+
+const ATYPE_CSS   = { 1:'#f6e05e', 2:'#f69c3e', 3:'#f95f5f', 4:'#c060ff', 5:'#38d68a' };
+const ATYPE_SHORT = { 1:'Micro', 2:'Fissura', 3:'Trinca', 4:'Rachadura', 5:'Normal' };
+
+function initAutoSeg() {
+  const sec = document.getElementById('autoseg-sec');
+  const sf  = S.scalars;
+  if (!sf || !S.sfField) { sec.style.display='none'; return; }
+
+  let mn=Infinity, mx=-Infinity;
+  for (let i=0;i<S.n;i++) { if(sf[i]<mn)mn=sf[i]; if(sf[i]>mx)mx=sf[i]; }
+  if (mx-mn < 0.5) { sec.style.display='none'; return; }
+  AutoSeg.sfMin=mn; AutoSeg.sfMax=mx;
+
+  const BINS=AutoSeg.BINS, range=mx-mn;
+  const raw=new Float32Array(BINS);
+  for (let i=0;i<S.n;i++) raw[Math.min(BINS-1,Math.floor((sf[i]-mn)/range*BINS))]++;
+  AutoSeg.histRaw=raw;
+
+  const maxH=Math.max(...raw);
+  AutoSeg.histNorm=new Float32Array(BINS);
+  for (let b=0;b<BINS;b++) AutoSeg.histNorm[b]=raw[b]/(maxH||1);
+
+  const lbl = S.sfField==='scalar_scalar_field' ? 'scalar_Scalar_field' : S.sfField;
+  document.getElementById('sf-field-info').textContent =
+    `campo: ${lbl}  |  range [${Math.round(mn)}, ${Math.round(mx)}]`;
+
+  sec.style.display='block';
+  autoDetectSegments();
+}
+
+// ── helpers ──────────────────────────────────────────────────────
+function smoothHist(hist, k=4) {
+  const out=new Float32Array(hist.length);
+  for (let i=0;i<hist.length;i++) {
+    let s=0,c=0;
+    for (let j=i-k;j<=i+k;j++) if(j>=0&&j<hist.length){s+=hist[j];c++;}
+    out[i]=s/c;
+  }
+  return out;
+}
+
+function otsuThreshold(hist, BINS) {
+  const total=hist.reduce((a,b)=>a+b,0);
+  let sum=0; for(let i=0;i<BINS;i++) sum+=i*hist[i];
+  let sumB=0,wB=0,varMax=0,tBin=0;
+  for (let i=0;i<BINS;i++) {
+    wB+=hist[i]; if(!wB) continue;
+    const wF=total-wB; if(!wF) break;
+    sumB+=i*hist[i];
+    const v=wB*wF*((sumB/wB)-(sum-sumB)/wF)**2;
+    if(v>varMax){varMax=v;tBin=i;}
+  }
+  return tBin;
+}
+
+// ── detecção usando scalar_labels + scalar_field ──────────────────
+function autoDetectWithLabels() {
+  const sf=S.scalars, lb=S.rawBinaryLabels;
+  const mn=AutoSeg.sfMin, mx=AutoSeg.sfMax, BINS=AutoSeg.BINS, range=mx-mn;
+
+  // Histogramas separados: crack vs normal
+  const cHist=new Float32Array(BINS), nHist=new Float32Array(BINS);
+  for (let i=0;i<S.n;i++) {
+    const b=Math.min(BINS-1,Math.floor((sf[i]-mn)/range*BINS));
+    if (lb[i]===1) cHist[b]++; else nHist[b]++;
+  }
+
+  // Fronteira crack/normal: bin mais alto ocupado por crack e bin mais baixo de normal
+  let crackMaxBin=0, normalMinBin=BINS-1;
+  for (let b=0;b<BINS;b++) if(cHist[b]>0) crackMaxBin=b;
+  for (let b=0;b<BINS;b++) if(nHist[b]>0){normalMinBin=b;break;}
+  const mainThresh=mn+((crackMaxBin+normalMinBin)/2/BINS)*range;
+
+  // Subdivide região de crack em 3 classes por quantis (33%, 66%)
+  const totalCrack=cHist.reduce((a,b)=>a+b,0);
+  let cum=0, q33bin=0, q66bin=0;
+  for (let b=0;b<=crackMaxBin;b++) {
+    cum+=cHist[b];
+    if (!q33bin && cum>=totalCrack*0.33) q33bin=b;
+    if (!q66bin && cum>=totalCrack*0.66) q66bin=b;
+  }
+  const q33=mn+(q33bin/BINS)*range;
+  const q66=mn+(q66bin/BINS)*range;
+
+  // Rachadura = SF mais baixo (retorno laser menor = fissura mais profunda/larga)
+  AutoSeg.segments=[
+    { upTo:q33,        label:4 }, // Rachadura
+    { upTo:q66,        label:3 }, // Trinca
+    { upTo:mainThresh, label:1 }, // Microfissura
+    { upTo:Infinity,   label:5 }, // Normal
+  ];
+  drawHistogram(); renderSegmentList();
+}
+
+// ── main detection ────────────────────────────────────────────────
+function autoDetectSegments() {
+  const BINS=AutoSeg.BINS, raw=AutoSeg.histRaw;
+  if (!raw) return;
+
+  // Se temos scalar_labels + scalar_field: usa combinação supervisionada
+  if (S.rawBinaryLabels && S.scalars) { autoDetectWithLabels(); return; }
+
+  const sm=smoothHist(raw, 4);
+  const maxH=Math.max(...sm);
+  const minProm=0.12;                          // pico precisa ser ≥12% do maior pico
+  const minDist=Math.max(3,Math.floor(BINS*0.06)); // distância mínima entre picos
+
+  // Encontra picos significativos
+  const peaks=[];
+  for (let i=1;i<BINS-1;i++) {
+    if (sm[i]>sm[i-1] && sm[i]>sm[i+1] && sm[i]/maxH>=minProm) {
+      if (peaks.length===0 || i-peaks[peaks.length-1]>=minDist) {
+        peaks.push(i);
+      } else if (sm[i]>sm[peaks[peaks.length-1]]) {
+        peaks[peaks.length-1]=i; // substitui por pico mais forte
+      }
+    }
+  }
+
+  // Thresholds = vale entre picos consecutivos
+  let threshBins=[];
+  for (let p=0;p<peaks.length-1;p++) {
+    let minV=Infinity,minIdx=peaks[p];
+    for (let b=peaks[p];b<=peaks[p+1];b++) if(sm[b]<minV){minV=sm[b];minIdx=b;}
+    threshBins.push(minIdx);
+  }
+
+  // Fallback: sem picos distintos → Otsu
+  if (threshBins.length===0) threshBins=[otsuThreshold(raw, BINS)];
+
+  // Converte bins → valores SF
+  const range=AutoSeg.sfMax-AutoSeg.sfMin;
+  const threshVals=threshBins.map(b=>AutoSeg.sfMin+(b/BINS)*range);
+
+  // Monta segmentos: menor SF → avaria (1..4), maior → Normal (5)
+  const crackSeq=[1,2,3,4];
+  AutoSeg.segments=threshVals.map((upTo,idx)=>({
+    upTo, label:crackSeq[Math.min(idx,crackSeq.length-1)]
+  }));
+  AutoSeg.segments.push({upTo:Infinity, label:5});
+
+  drawHistogram();
+  renderSegmentList();
+}
+
+// ── histogram render ──────────────────────────────────────────────
+function drawHistogram() {
+  const cnv=document.getElementById('sf-hist');
+  const ctx=cnv.getContext('2d');
+  const W=cnv.width, H=cnv.height, BINS=AutoSeg.BINS;
+  const mn=AutoSeg.sfMin, mx=AutoSeg.sfMax;
+  const segs=AutoSeg.segments;
+
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#0e1118'; ctx.fillRect(0,0,W,H);
+  if (!AutoSeg.histNorm || !segs.length) return;
+
+  const barW=W/BINS;
+  for (let b=0;b<BINS;b++) {
+    const sfMid=mn+((b+0.5)/BINS)*(mx-mn);
+    const seg=segs.find(s=>sfMid<=s.upTo)||segs[segs.length-1];
+    const h=AutoSeg.histNorm[b]*(H-4);
+    ctx.fillStyle=(ATYPE_CSS[seg.label]||'#888')+'cc';
+    ctx.fillRect(b*barW+0.5, H-h, barW-1, h);
+  }
+
+  // Linhas de threshold
+  ctx.lineWidth=1.5; ctx.setLineDash([3,2]); ctx.strokeStyle='#e8f0fa';
+  for (let i=0;i<segs.length-1;i++) {
+    const x=Math.round(((segs[i].upTo-mn)/(mx-mn))*W);
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+}
+
+// ── segment list ──────────────────────────────────────────────────
+function renderSegmentList() {
+  const segs=AutoSeg.segments, sf=S.scalars;
+  const mn=AutoSeg.sfMin, mx=AutoSeg.sfMax;
+
+  // Conta pontos por segmento em O(n)
+  const counts=new Array(segs.length).fill(0);
+  for (let p=0;p<S.n;p++) {
+    const v=sf[p];
+    for (let i=0;i<segs.length;i++) { if(v<=segs[i].upTo){counts[i]++;break;} }
+  }
+
+  let html='';
+  let prev=mn;
+  for (let i=0;i<segs.length;i++) {
+    const s=segs[i];
+    const upLbl=s.upTo===Infinity?`${Math.round(mx)}`:`${Math.round(s.upTo)}`;
+    const pct=(100*counts[i]/S.n).toFixed(1);
+    html+=`<div class="seg-row" onclick="cycleSegLabel(${i})">
+      <div class="ldot" style="background:${ATYPE_CSS[s.label]}"></div>
+      <div style="font-size:7px;flex:1;color:var(--text-dim)">[${Math.round(prev)}&ndash;${upLbl}]</div>
+      <div style="font-size:8px;color:${ATYPE_CSS[s.label]}">${ATYPE_SHORT[s.label]}</div>
+      <div style="font-size:7px;color:var(--text-dim);margin-left:3px">${pct}%</div>
+    </div>`;
+    prev=s.upTo===Infinity?mx:s.upTo;
+  }
+  document.getElementById('seg-list').innerHTML=html;
+}
+
+function cycleSegLabel(i) {
+  const order=[1,2,3,4,5];
+  const cur=AutoSeg.segments[i].label;
+  AutoSeg.segments[i].label=order[(order.indexOf(cur)+1)%order.length];
+  drawHistogram(); renderSegmentList();
+}
+
+// ── apply ─────────────────────────────────────────────────────────
+function applyAutoSeg() {
+  if (!S.loaded||!AutoSeg.segments.length) return;
+  pushUndo();
+  const sf=S.scalars, segs=AutoSeg.segments;
+  const counts=new Array(segs.length).fill(0);
+  for (let i=0;i<S.n;i++) {
+    const v=sf[i];
+    for (let j=0;j<segs.length;j++) {
+      if(v<=segs[j].upTo){S.labels[i]=segs[j].label;counts[j]++;break;}
+    }
+  }
+  refreshColors(); updateStats();
+  const summary=segs.map((s,j)=>`${ATYPE_SHORT[s.label]}:${counts[j].toLocaleString('pt-BR')}`).join(' | ');
+  toast(`⚡ ${summary}`);
+}
+
+// ── histogram click → move nearest threshold ──────────────────────
+document.getElementById('sf-hist').addEventListener('click', function(e) {
+  const segs=AutoSeg.segments;
+  if (!segs.length) return;
+  const rect=this.getBoundingClientRect();
+  const clickVal=AutoSeg.sfMin+(e.clientX-rect.left)/rect.width*(AutoSeg.sfMax-AutoSeg.sfMin);
+
+  // Encontra o threshold mais próximo do clique (ignora último = Infinity)
+  const movable=segs.slice(0,-1);
+  if (!movable.length) return;
+  let nearIdx=0, nearDist=Infinity;
+  for (let i=0;i<movable.length;i++) {
+    const d=Math.abs(movable[i].upTo-clickVal);
+    if(d<nearDist){nearDist=d;nearIdx=i;}
+  }
+  segs[nearIdx].upTo=Math.max(AutoSeg.sfMin, Math.min(AutoSeg.sfMax, clickVal));
+  drawHistogram(); renderSegmentList();
+});
+</script>
+</body>
+</html>

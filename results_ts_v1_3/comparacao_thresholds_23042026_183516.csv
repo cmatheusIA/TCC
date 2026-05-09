@@ -1,0 +1,2 @@
+estrategia,threshold,precision,recall,f1,iou,auroc,avg_precision
+GMM por nuvem,adaptativo,0.0663,0.097,0.0787,0.041,0.4823,0.0619

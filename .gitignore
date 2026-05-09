@@ -1,6 +1,8 @@
 zip/
 text_for_ia/
+docs/
 
+__pycache__/
 .claude
 .venv
 
@@ -16,3 +18,5 @@ models_ts/
 models_v5/
 
 pretrained_models/
+
+*.Identifier
